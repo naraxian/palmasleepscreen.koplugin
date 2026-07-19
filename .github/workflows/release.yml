@@ -6,8 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to attach zip to (e.g., v1.0.0)'
-        required: true
+        description: 'Release tag to attach zip to (e.g., v1.1.0)'
+        # Must not be required. A required dispatch input has no value when the
+        # workflow is compiled for a release event, which fails the run before it
+        # starts (startup_failure / BuildFailed) -- so the release trigger breaks
+        # while manual dispatch keeps working.
+        required: false
 
 permissions:
   contents: write
@@ -20,7 +24,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # `inputs` rather than `github.event.inputs`: the former is null on a
+          # release event, the latter is not defined for it at all.
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Create plugin directory structure
         run: |
@@ -42,7 +48,7 @@ jobs:
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: build/palmasleepscreen.koplugin.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
