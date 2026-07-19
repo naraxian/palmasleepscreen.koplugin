@@ -1,0 +1,25 @@
+LICENSE
+  s_c9c0922a17637e::t_60c49df7af14c5 1-661
+.gitattributes
+  s_c9c0922a17637e::t_b0af577197f185 1-6
+README.md
+  s_c9c0922a17637e::t_08e715f9bdeb6e 1-136
+.gitignore
+  s_c9c0922a17637e::t_c68727fd51808f 1-2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b2917a6e364d6e6e7a85a09924682f70a035b34d",
+  "prompts": {},
+  "sessions": {
+    "s_c9c0922a17637e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e2dfdc42-c7b5-4e8a-a570-d63fbde85f3c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "naraxian <naraxian@users.noreply.github.com>"
+    }
+  }
+}
