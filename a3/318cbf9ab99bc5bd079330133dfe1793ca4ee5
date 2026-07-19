@@ -1,0 +1,24 @@
+main.lua
+  s_1bd20688f5746c::t_4bf14dd2af193e 1354-1378
+  s_1bd20688f5746c::t_056d494038a7c1 18
+  s_1bd20688f5746c::t_152549d3dd3840 398-411
+  s_1bd20688f5746c::t_6ba9838b54814a 1353
+README.md
+  s_1bd20688f5746c::t_28eb85a12489f8 87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a3318cbf9ab99bc5bd079330133dfe1793ca4ee5",
+  "prompts": {},
+  "sessions": {
+    "s_1bd20688f5746c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8de2988-d236-4c5b-b7ca-b14f8c95bf53",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Nara Xian <hello@naraxian.net>"
+    }
+  }
+}
