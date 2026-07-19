@@ -87,6 +87,8 @@ not know about.
 | **Preview** | Renders and shows the result full screen, exactly as written to disk. Tap anywhere to close. |
 | **Refresh now** | Renders immediately and reports the result, timing, dimensions and file size. |
 | **Output format** | Experimental — see below. |
+| **Colour quantization** | Experimental — reduces the image to the panel's palette. See below. |
+| **Write test pattern instead** | Diagnostic — replaces the sleep screen with a card of known values. See below. |
 | **Log render timings** | Writes render durations to the KOReader log. |
 
 ### Output format
@@ -121,6 +123,50 @@ Two things will make every format look identical if you miss them:
 **Refresh now** reports the rendered dimensions. If they are not the panel's
 native resolution, the system is rescaling the image before it ever reaches the
 screen, and that alone would alter the colours.
+
+In practice all four formats look the same on the panel. That is itself a
+result: they differ in container, channel count and compression, so if the
+output is identical the system is transforming the **decoded bitmap**, not
+reacting to the file. No encoding change will help, and the remaining options
+are pre-compensation and measurement.
+
+### Colour quantization
+
+Kaleido 3 renders **16 grey levels and 4096 colours** — 16³, so 16 levels per
+channel, landing on multiples of 17. The system almost certainly quantizes to
+that palette itself.
+
+An image already sitting on the palette gives its quantizer nothing to change:
+every value maps to itself, so the step becomes a no-op. This is the same
+reasoning as matching the panel resolution exactly to avoid being rescaled.
+
+Ordered (Bayer) dithering keeps gradients smooth. It is positionally fixed, so
+quantizing an already-quantized image leaves it alone — unlike error diffusion,
+which would keep finding new residuals to spread and would never be stable under
+a second pass.
+
+Costs about 15 ms at full panel resolution, on top of the render.
+
+### Test pattern
+
+Guessing at the transform has diminishing returns. This replaces the sleep
+screen with a card of known values — grey ramps, the 16 Kaleido grey levels,
+R/G/B ramps, colour swatches at full and half strength, a near-neutral gradient,
+and single-level steps around mid-grey.
+
+Photograph the sleep screen and compare against the same file in **Preview**.
+What differs identifies what is being done:
+
+| Observation | Means |
+| --- | --- |
+| Grey steps shift or crush | A tone curve |
+| Swatches shift hue | A colour matrix, or a saturation change |
+| Smooth ramps gain contours | Quantization — and the contour count tells you at which level |
+| The near-neutral band speckles | Chroma dithering |
+| Band edges soften | The image is being rescaled |
+
+Once the transform is known, it can be inverted in the existing enhancement
+parameters instead of guessed at. Turn the pattern off again when done.
 
 ### Cover enhancement
 

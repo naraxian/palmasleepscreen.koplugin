@@ -348,6 +348,154 @@ local function enhanceCover(bb, p)
     end
 end
 
+---------------------------------------------------------------------------
+-- output quantization
+---------------------------------------------------------------------------
+
+-- Kaleido 3 renders 16 grey levels and 4096 colours -- 16^3, so 16 levels per
+-- channel, landing on multiples of 17.
+--
+-- The point is not to reduce the image for its own sake. Every file format
+-- produced the same result on the panel, which means the system is transforming
+-- the decoded bitmap rather than reacting to the file, and one thing that
+-- transform plausibly does is quantize to the panel's palette. An image already
+-- sitting on that palette gives its quantizer nothing to change: every value
+-- maps to itself, so the step becomes a no-op. Same reasoning as matching the
+-- panel resolution exactly to avoid being rescaled.
+local KALEIDO_LEVELS = 16
+
+-- Ordered dither, so quantizing a gradient does not band it. Bayer rather than
+-- error diffusion deliberately: it is positionally fixed, so quantizing an
+-- already-quantized image leaves it alone. Error diffusion would keep finding
+-- new residuals to push around.
+local BAYER8 = {
+     0, 32,  8, 40,  2, 34, 10, 42,
+    48, 16, 56, 24, 50, 18, 58, 26,
+    12, 44,  4, 36, 14, 46,  6, 38,
+    60, 28, 52, 20, 62, 30, 54, 22,
+     3, 35, 11, 43,  1, 33,  9, 41,
+    51, 19, 59, 27, 49, 17, 57, 25,
+    15, 47,  7, 39, 13, 45,  5, 37,
+    63, 31, 55, 23, 61, 29, 53, 21,
+}
+
+--- Quantizes `bb` in place to `levels` values per channel. `bb` must be RGB32.
+local function quantizeToPalette(bb, levels, dither)
+    local w, h = bb:getWidth(), bb:getHeight()
+    if levels < 2 then return end
+    local step = 255 / (levels - 1)
+    local top = levels - 1
+
+    -- Exact output values, so the result really does sit on the palette rather
+    -- than near it -- the whole point is that requantizing changes nothing.
+    local out = {}
+    for i = 0, top do out[i] = math.floor(i * step + 0.5) end
+
+    for y = 0, h - 1 do
+        local brow = (y % 8) * 8
+        for x = 0, w - 1 do
+            local px = bb:getPixelP(x, y)
+            -- centred on zero, scaled to one quantization step
+            local bias = dither and ((BAYER8[brow + (x % 8) + 1] / 64) - 0.5) * step or 0
+            local r = (px.r + bias) / step + 0.5
+            local g = (px.g + bias) / step + 0.5
+            local b = (px.b + bias) / step + 0.5
+            r = r < 0 and 0 or (r > top and top or math.floor(r))
+            g = g < 0 and 0 or (g > top and top or math.floor(g))
+            b = b < 0 and 0 or (b > top and top or math.floor(b))
+            px.r, px.g, px.b = out[r], out[g], out[b]
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- test pattern
+---------------------------------------------------------------------------
+
+-- Known input, so the system's transform can be read off the panel instead of
+-- guessed at. Photograph the sleep screen and compare against the same file in
+-- Preview; what differs identifies what is being done:
+--
+--   grey steps shift or crush ......... a tone curve
+--   colour patches shift hue .......... a colour matrix, or a saturation change
+--   smooth ramps gain contours ........ quantization, and at which level
+--   the near-neutral band speckles .... chroma dithering
+--   band edges soften ................. the image is being rescaled
+local function paintTestPattern(bb, w, h)
+    local function rect(x, y, rw, rh, r, g, b)
+        if rw > 0 and rh > 0 then
+            bb:paintRectRGB32(math.floor(x), math.floor(y), math.floor(rw), math.floor(rh),
+                Blitbuffer.ColorRGB32(r, g, b, 0xFF))
+        end
+    end
+
+    -- Nine bands down the screen. Every value below is exact and known, so any
+    -- deviation on the panel is the system's doing.
+    local bands = 9
+    local bh = h / bands
+    local y = 0
+
+    -- 1: continuous grey ramp -- contouring here means quantization
+    for x = 0, w - 1 do
+        local v = math.floor(255 * x / (w - 1) + 0.5)
+        rect(x, y, 1, bh, v, v, v)
+    end
+    y = y + bh
+
+    -- 2: the 16 grey levels Kaleido 3 actually renders. These should survive
+    -- untouched; if they shift, a tone curve is being applied.
+    for i = 0, 15 do
+        local v = i * 17
+        rect(i * w / 16, y, w / 16 + 1, bh, v, v, v)
+    end
+    y = y + bh
+
+    -- 3-5: continuous R, G, B ramps
+    for _, ch in ipairs({ "r", "g", "b" }) do
+        for x = 0, w - 1 do
+            local v = math.floor(255 * x / (w - 1) + 0.5)
+            rect(x, y, 1, bh,
+                ch == "r" and v or 0, ch == "g" and v or 0, ch == "b" and v or 0)
+        end
+        y = y + bh
+    end
+
+    -- 6: primaries and secondaries at full strength
+    local swatches = {
+        { 255, 0, 0 }, { 0, 255, 0 }, { 0, 0, 255 },
+        { 0, 255, 255 }, { 255, 0, 255 }, { 255, 255, 0 },
+        { 255, 255, 255 }, { 0, 0, 0 },
+    }
+    for i, c in ipairs(swatches) do
+        rect((i - 1) * w / #swatches, y, w / #swatches + 1, bh, c[1], c[2], c[3])
+    end
+    y = y + bh
+
+    -- 7: the same hues at half strength -- saturation changes show up here
+    -- far more clearly than at full strength, which tends to clip either way
+    for i, c in ipairs(swatches) do
+        rect((i - 1) * w / #swatches, y, w / #swatches + 1, bh,
+            math.floor(c[1] * 0.5), math.floor(c[2] * 0.5), math.floor(c[3] * 0.5))
+    end
+    y = y + bh
+
+    -- 8: near-neutral gradient, the case that speckles. Chroma stays within
+    -- +/-6 of grey, which is where the panel's dithering is most visible.
+    for x = 0, w - 1 do
+        local t = x / (w - 1)
+        local v = math.floor(60 + 120 * t + 0.5)
+        rect(x, y, 1, bh, v + 6, v, v - 6)
+    end
+    y = y + bh
+
+    -- 9: mid-grey with single-level steps around it, to reveal the finest
+    -- distinction the panel still resolves after whatever it does
+    for i = 0, 15 do
+        local v = 128 + (i - 8) * 2
+        rect(i * w / 16, y, w / 16 + 1, h - y, v, v, v)
+    end
+end
+
 --- Opaque copy, for the encoders that key off the channel count. Does not free
 -- the input -- the caller still owns it.
 local function toRGB24(bb)
@@ -525,6 +673,9 @@ function PalmaSleepScreen:init()
     self.enabled = self.settings:nilOrTrue("enabled")
     self.format = self.settings:readSetting("format") or "png"
     self.jpeg_quality = self.settings:readSetting("jpeg_quality") or 90
+    self.quantize = self.settings:readSetting("quantize") or 0
+    self.dither = self.settings:nilOrTrue("dither")
+    self.test_pattern = self.settings:isTrue("test_pattern")
     self.output_path = normalizeOutputPath(self.settings:readSetting("output_path"), self.format)
         or normalizeOutputPath(defaultOutputPath(), self.format)
     -- Default is per-chapter, not per-page: a full-screen PNG of photographic
@@ -1078,7 +1229,9 @@ function PalmaSleepScreen:render(interactive)
     return true
 end
 
-function PalmaSleepScreen:doRender()
+--- Composes the sleep screen and returns the buffer plus its metrics. The
+-- caller owns the buffer and must :free() it.
+function PalmaSleepScreen:composeImage()
     local m = self:metrics()
     local data = self:bookData()
     local p = self:prepare(m, data)
@@ -1103,6 +1256,25 @@ function PalmaSleepScreen:doRender()
     -- the bottom, so the text keeps a fixed distance below the cover edge.
     panel:paintTo(bb, m.margin, panel_top)
     panel:free()
+
+    return bb, m
+end
+
+function PalmaSleepScreen:doRender()
+    local bb, m
+    if self.test_pattern then
+        m = self:metrics()
+        bb = Blitbuffer.new(m.screen_w, m.screen_h, Blitbuffer.TYPE_BBRGB32)
+        paintTestPattern(bb, m.screen_w, m.screen_h)
+    else
+        bb, m = self:composeImage()
+    end
+
+    -- Last, on the finished image: quantizing before compositing would let the
+    -- text and panel land back off-palette.
+    if self.quantize > 0 then
+        quantizeToPalette(bb, self.quantize, self.dither)
+    end
 
     -- reported alongside the render, so a size that is not the panel's native
     -- resolution is visible rather than assumed -- anything else gets rescaled
@@ -1286,6 +1458,19 @@ function PalmaSleepScreen:menuEntryFormat(fmt)
                     show_icon = true,
                 })
             end
+        end,
+    }
+end
+
+function PalmaSleepScreen:menuEntryQuantize(levels, label)
+    return {
+        text = label,
+        checked_func = function() return self.quantize == levels end,
+        radio = true,
+        keep_menu_open = true,
+        callback = function()
+            self:saveSetting("quantize", levels)
+            self:render(true)
         end,
     }
 end
@@ -1562,6 +1747,49 @@ The device may also cache the sleep screen. If a change appears to do nothing, r
                     })
                     return t
                 end)(),
+            },
+            {
+                text = _("Colour quantization"),
+                help_text = _([[Reduces the image to a fixed number of levels per channel before writing it.
+
+Kaleido 3 renders 16 grey levels and 4096 colours — 16³, so 16 levels per channel. The system almost certainly quantizes to that palette itself. An image already sitting on the palette gives its quantizer nothing to change, which may stop it touching the image at all.
+
+Ordered dithering keeps gradients smooth. It is positionally fixed, so quantizing an already-quantized image leaves it alone — unlike error diffusion, which would keep finding new residuals to spread.]]),
+                sub_item_table = {
+                    self:menuEntryQuantize(0, _("Off")),
+                    self:menuEntryQuantize(KALEIDO_LEVELS, _("16 levels (Kaleido 3)")),
+                    self:menuEntryQuantize(8, _("8 levels")),
+                    self:menuEntryQuantize(4, _("4 levels")),
+                    {
+                        text = _("Ordered dithering"),
+                        enabled_func = function() return self.quantize > 0 end,
+                        checked_func = function() return self.dither end,
+                        callback = function()
+                            self:saveSetting("dither", not self.dither)
+                            self:render(true)
+                        end,
+                        separator = true,
+                    },
+                },
+            },
+            {
+                text = _("Write test pattern instead"),
+                help_text = _([[Replaces the sleep screen with a card of known values: grey ramps, the 16 Kaleido grey levels, R/G/B ramps, colour swatches at full and half strength, and a near-neutral gradient.
+
+Photograph the sleep screen and compare it against the same file in Preview. What differs identifies what the system is doing:
+
+• grey steps shift or crush — a tone curve
+• swatches shift hue — a colour matrix or saturation change
+• smooth ramps gain contours — quantization, and at which level
+• the near-neutral band speckles — chroma dithering
+• band edges soften — the image is being rescaled
+
+This measures the transform rather than guessing at it. Turn it off again when you are done.]]),
+                checked_func = function() return self.test_pattern end,
+                callback = function()
+                    self:saveSetting("test_pattern", not self.test_pattern)
+                    self:render(true)
+                end,
             },
             {
                 text = _("Log render timings"),
