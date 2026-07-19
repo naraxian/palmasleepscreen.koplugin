@@ -318,6 +318,7 @@ function PalmaSleepScreen:init()
     self.trigger = self.settings:readSetting("trigger") or "chapter"
     self.interval = self.settings:readSetting("interval") or 10
     self.text_scale = self.settings:readSetting("text_scale") or 1.0
+    self.compact_meta = self.settings:isTrue("compact_meta")
     self.render_on_suspend = self.settings:isTrue("render_on_suspend")
     self.debug = self.settings:isTrue("debug")
 
@@ -581,9 +582,19 @@ function PalmaSleepScreen:buildPanel(width, m, fg, panel_color, data)
     if data.chapter_num and data.chapter_total then
         chapter_label = T(_("Chapter %1 / %2"), data.chapter_num, data.chapter_total)
     end
-    table.insert(group, splitRow(
-        string.format("%d%%", math.floor(data.percentage * 100 + 0.5)),
-        chapter_label, self:face("cfont", m.footer, m)))
+    local progress_label = string.format("%d%%", math.floor(data.percentage * 100 + 0.5))
+    -- In compact mode the secondary line goes away entirely, so time left rides
+    -- along with the percentage instead of being dropped with it.
+    if self.compact_meta and data.time_left then
+        progress_label = T(_("%1  ·  %2 left"), progress_label, data.time_left)
+    end
+    table.insert(group, splitRow(progress_label, chapter_label, self:face("cfont", m.footer, m)))
+
+    -- Compact mode drops battery and timestamp so the Boox system status bar,
+    -- which is drawn over the sleep screen, is not duplicating them.
+    if self.compact_meta then
+        return group
+    end
 
     -- Secondary line: time left and chapter count on the left, battery and
     -- timestamp on the right. Deliberately smaller and last so it stays out of
@@ -649,8 +660,8 @@ end
 -- geometry. All of this is invariant for a given book and text scale, so it is
 -- cached; only the panel contents are rebuilt per render.
 function PalmaSleepScreen:prepare(m, data)
-    local key = string.format("%s|%s|%dx%d", tostring(self.ui.document and self.ui.document.file),
-        tostring(self.text_scale), m.screen_w, m.screen_h)
+    local key = string.format("%s|%s|%s|%dx%d", tostring(self.ui.document and self.ui.document.file),
+        tostring(self.text_scale), tostring(self.compact_meta), m.screen_w, m.screen_h)
     if self.prepared and self.prepared.key == key then
         return self.prepared
     end
@@ -1033,6 +1044,18 @@ This can only freshen an image that is already up to date. The system reads the 
                     self:menuEntryTextScale(1.0, _("Medium")),
                     self:menuEntryTextScale(1.2, _("Large")),
                 },
+            },
+            {
+                text = _("Hide battery and date"),
+                help_text = _([[Drops the battery level and the timestamp, and moves the time left onto the progress line.
+
+For use with the Boox system status bar, which draws its own clock and battery over the sleep screen.]]),
+                checked_func = function() return self.compact_meta end,
+                callback = function()
+                    self:saveSetting("compact_meta", not self.compact_meta)
+                    self:releasePrepared()
+                    self:requestRender()
+                end,
                 separator = true,
             },
             {

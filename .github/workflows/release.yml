@@ -1,0 +1,48 @@
+name: Create Release Zip
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach zip to (e.g., v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Create plugin directory structure
+        run: |
+          mkdir -p build/palmasleepscreen.koplugin
+          rsync -av --exclude='.git' \
+                    --exclude='.github' \
+                    --exclude='.claude' \
+                    --exclude='build' \
+                    --exclude='screenshots' \
+                    --exclude='.gitignore' \
+                    --exclude='.gitattributes' \
+                    . build/palmasleepscreen.koplugin/
+
+      - name: Create zip archive
+        run: |
+          cd build
+          zip -r palmasleepscreen.koplugin.zip palmasleepscreen.koplugin
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: build/palmasleepscreen.koplugin.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
