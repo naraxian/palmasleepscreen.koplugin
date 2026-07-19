@@ -13,10 +13,12 @@ local DataStorage = require("datastorage")
 local Device = require("device")
 local Font = require("ui/font")
 local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageViewer = require("ui/widget/imageviewer")
 local InfoMessage = require("ui/widget/infomessage")
+local InputContainer = require("ui/widget/container/inputcontainer")
 local InputDialog = require("ui/widget/inputdialog")
 local LuaSettings = require("luasettings")
 local PathChooser = require("ui/widget/pathchooser")
@@ -449,6 +451,60 @@ function BatteryIcon:paintTo(bb, x, y)
 end
 
 ---------------------------------------------------------------------------
+-- on-screen sleep screen
+---------------------------------------------------------------------------
+
+-- Painted straight onto the panel instead of being handed to the system as a
+-- file. Boox renders a screensaver file through its own pipeline, which applies
+-- its own colour handling -- the same PNG looks different there than it does in
+-- KOReader. Its "transparent" screensaver instead keeps whatever is already on
+-- the panel, so painting the image ourselves and letting the panel hold it is
+-- the only way to get the colours KOReader actually rendered.
+local SleepScreenWidget = InputContainer:extend{
+    image_bb = nil,
+    covers_fullscreen = true, -- hint for UIManager:_repaint()
+}
+
+function SleepScreenWidget:init()
+    self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
+    -- Tap dismisses it. The resume event normally does that, but if it never
+    -- arrives this is the way out rather than a stuck screen.
+    if Device:isTouchDevice() then
+        self.ges_events = {
+            Tap = { GestureRange:new{ ges = "tap", range = self.dimen } },
+        }
+    end
+end
+
+function SleepScreenWidget:getSize()
+    return self.dimen
+end
+
+function SleepScreenWidget:paintTo(bb, x, y)
+    if not self.image_bb then return end
+    bb:blitFrom(self.image_bb, x, y, 0, 0,
+        self.image_bb:getWidth(), self.image_bb:getHeight())
+end
+
+function SleepScreenWidget:onTap()
+    UIManager:close(self, "full")
+    return true
+end
+
+--- Fires however the widget goes away -- resume, a tap, or the plugin closing --
+-- so the owner cannot be left holding a reference to a closed widget.
+function SleepScreenWidget:onCloseWidget()
+    if self.image_bb then
+        self.image_bb:free()
+        self.image_bb = nil
+    end
+    if self.close_callback then
+        self.close_callback()
+        self.close_callback = nil
+    end
+end
+
+---------------------------------------------------------------------------
 -- preview
 ---------------------------------------------------------------------------
 
@@ -502,6 +558,7 @@ function PalmaSleepScreen:init()
     self.interval = self.settings:readSetting("interval") or 10
     self.text_scale = self.settings:readSetting("text_scale") or 1.0
     self.compact_meta = self.settings:isTrue("compact_meta")
+    self.screen_mode = self.settings:isTrue("screen_mode")
     self.enhance = self.settings:isTrue("enhance")
     self.enhance_params = {}
     for key, default in pairs(ENHANCE_DEFAULTS) do
@@ -514,6 +571,7 @@ function PalmaSleepScreen:init()
     self.pages_since_render = 0
     self.last_chapter_idx = nil
     self.prepared = nil
+    self.sleep_widget = nil
 
     -- stable reference so it can be unscheduled
     self.deferred_render = function()
@@ -526,6 +584,7 @@ end
 
 function PalmaSleepScreen:onCloseWidget()
     UIManager:unschedule(self.deferred_render)
+    self:closeOnScreen()
     self:releasePrepared()
 end
 
@@ -1043,7 +1102,10 @@ function PalmaSleepScreen:render(interactive)
     return true
 end
 
-function PalmaSleepScreen:doRender()
+--- Composes the sleep screen and returns the buffer. The caller owns it and
+-- must :free() it -- either after encoding it to a file, or when the on-screen
+-- widget holding it closes.
+function PalmaSleepScreen:composeImage()
     local m = self:metrics()
     local data = self:bookData()
     local p = self:prepare(m, data)
@@ -1068,6 +1130,12 @@ function PalmaSleepScreen:doRender()
     -- the bottom, so the text keeps a fixed distance below the cover edge.
     panel:paintTo(bb, m.margin, panel_top)
     panel:free()
+
+    return bb
+end
+
+function PalmaSleepScreen:doRender()
+    local bb = self:composeImage()
 
     -- never leave a partial image at the output path
     local tmp = self.output_path .. ".tmp"
@@ -1101,6 +1169,9 @@ end
 -- scheduled render reads current state when it fires, so nothing is lost.
 function PalmaSleepScreen:requestRender()
     if not self.enabled then return end
+    -- Screen mode composes at suspend from current state, so there is nothing
+    -- for a page or chapter trigger to keep up to date.
+    if self.screen_mode then return end
     if self.render_pending then return end
     self.render_pending = true
     UIManager:scheduleIn(RENDER_DELAY, self.deferred_render)
@@ -1137,26 +1208,72 @@ function PalmaSleepScreen:onPageUpdate(pageno)
     end
 end
 
+---------------------------------------------------------------------------
+-- screen mode
+---------------------------------------------------------------------------
+
+--- Composes and paints the sleep screen onto the panel, synchronously. The
+-- panel then holds it, and Boox's transparent screensaver keeps what is already
+-- there rather than rendering a file of its own.
+function PalmaSleepScreen:showOnScreen()
+    if self.sleep_widget then return end
+    if not self.ui or not self.ui.document then return end
+
+    local ok, bb = pcall(function() return self:composeImage() end)
+    if not ok or not bb then
+        logger.warn("PalmaSleepScreen: could not compose the sleep screen:", bb)
+        return
+    end
+
+    self.sleep_widget = SleepScreenWidget:new{
+        image_bb = bb,
+        -- Cleared here rather than only in closeOnScreen: a tap dismisses the
+        -- widget on its own, and a stale reference would make showOnScreen
+        -- return early forever.
+        close_callback = function() self.sleep_widget = nil end,
+    }
+    UIManager:show(self.sleep_widget, "full")
+    -- The device is on its way down, so the usual scheduled repaint would never
+    -- run. Push it to the panel now.
+    UIManager:forceRePaint()
+end
+
+function PalmaSleepScreen:closeOnScreen()
+    if not self.sleep_widget then return end
+    -- frees the buffer and clears self.sleep_widget via onCloseWidget
+    UIManager:close(self.sleep_widget, "full")
+    self.sleep_widget = nil
+end
+
 --- Rendered inline, not scheduled: there is no time left once the device is
--- going down. Note this only ever *freshens* an already-current image — see the
--- menu help for why it cannot be relied on by itself.
-function PalmaSleepScreen:renderOnSuspend()
-    if not self.enabled or not self.render_on_suspend then return end
+-- going down. In file mode this only ever *freshens* an already-current image —
+-- see the menu help for why it cannot be relied on by itself.
+function PalmaSleepScreen:onDeviceSuspend()
+    if not self.enabled then return end
     UIManager:unschedule(self.deferred_render)
     self.render_pending = false
-    self:render()
+    if self.screen_mode then
+        self:showOnScreen()
+    elseif self.render_on_suspend then
+        self:render()
+    end
 end
 
 -- generic devices (Device:suspend), and Android's APP_CMD_PAUSE
-PalmaSleepScreen.onSuspend = PalmaSleepScreen.renderOnSuspend
-PalmaSleepScreen.onRequestSuspend = PalmaSleepScreen.renderOnSuspend
+PalmaSleepScreen.onSuspend = PalmaSleepScreen.onDeviceSuspend
+PalmaSleepScreen.onRequestSuspend = PalmaSleepScreen.onDeviceSuspend
+
+-- generic devices, and Android's APP_CMD_RESUME
+function PalmaSleepScreen:onResume()
+    self:closeOnScreen()
+end
 
 function PalmaSleepScreen:onCloseDocument()
     -- render inline: the document is about to go away, so a scheduled render
     -- would find nothing to read
     UIManager:unschedule(self.deferred_render)
     self.render_pending = false
-    self:render()
+    if not self.screen_mode then self:render() end
     self:releasePrepared()
 end
 
@@ -1250,7 +1367,7 @@ function PalmaSleepScreen:menuEntryEnhanceParam(key, label, min, max, step, prec
                 value_max = max,
                 value_step = step,
                 value_hold_step = step * 4,
-                precision = "%.2f",
+                precision = precision,
                 default_value = ENHANCE_DEFAULTS[key],
                 title_text = label,
                 ok_text = _("Set"),
@@ -1285,9 +1402,26 @@ function PalmaSleepScreen:addToMainMenu(menu_items)
                 separator = true,
             },
             {
+                text = _("Draw on screen instead of writing a file"),
+                help_text = _([[Paints the sleep screen onto the panel as the device suspends, and leaves it there, instead of writing a PNG for the system to display.
+
+Boox renders a screensaver file through its own pipeline, which applies its own colour handling — the same image looks different there than it does in KOReader. Its "transparent" screensaver instead keeps whatever is already on the panel, so this is the only way to get the colours you see in Preview.
+
+Set the Boox screensaver to transparent for this to survive. It also needs KOReader to be in the foreground when the device sleeps.
+
+No file is written in this mode, and the update triggers do nothing: the image is composed at suspend, from the state at that moment.]]),
+                checked_func = function() return self.screen_mode end,
+                callback = function()
+                    self:saveSetting("screen_mode", not self.screen_mode)
+                    if not self.screen_mode then self:requestRender() end
+                end,
+                separator = true,
+            },
+            {
                 text_func = function()
                     return T(_("Output file: %1"), self.output_path)
                 end,
+                enabled_func = function() return not self.screen_mode end,
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
                     self:chooseOutputPath(touchmenu_instance)
@@ -1295,6 +1429,7 @@ function PalmaSleepScreen:addToMainMenu(menu_items)
             },
             {
                 text = _("Check output path"),
+                enabled_func = function() return not self.screen_mode end,
                 keep_menu_open = true,
                 callback = function()
                     local ok, reason = self:checkOutputPath(self.output_path)
@@ -1307,6 +1442,7 @@ function PalmaSleepScreen:addToMainMenu(menu_items)
             },
             {
                 text = _("Update"),
+                enabled_func = function() return not self.screen_mode end,
                 sub_item_table = {
                     self:menuEntryTrigger("page", _("Every page")),
                     self:menuEntryTrigger("chapter", _("Every chapter")),
@@ -1424,9 +1560,15 @@ The result is cached, so the work is done once per book rather than on every upd
                     -- queued render cannot overwrite the file behind the viewer
                     UIManager:unschedule(self.deferred_render)
                     self.render_pending = false
+                    -- Each mode previews the path it actually uses: screen mode
+                    -- paints the composed buffer exactly as suspend will, while
+                    -- file mode shows the written file rather than the buffer it
+                    -- came from, so a preview cannot pass over a bad write.
+                    if self.screen_mode then
+                        self:showOnScreen()
+                        return
+                    end
                     if not self:render() then return end -- render reports its own failure
-                    -- Shows the written file rather than the buffer it came from:
-                    -- a preview that skipped the encode could not catch a bad write.
                     UIManager:show(PreviewViewer:new{
                         file = self.output_path,
                         fullscreen = true,
@@ -1436,6 +1578,7 @@ The result is cached, so the work is done once per book rather than on every upd
             },
             {
                 text = _("Refresh now"),
+                enabled_func = function() return not self.screen_mode end,
                 keep_menu_open = true,
                 callback = function() self:render(true) end,
             },
