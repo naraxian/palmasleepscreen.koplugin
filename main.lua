@@ -1,0 +1,1052 @@
+--[[--
+@module koplugin.palmasleepscreen
+
+Composes a sleep screen image from the current book's cover and reading progress:
+the cover full-bleed across the top of the screen, and an information panel filled
+with the cover's dominant colour below it.
+
+Cover extraction and image writing follow plugins/coverimage.koplugin.
+]]
+
+local Blitbuffer = require("ffi/blitbuffer")
+local DataStorage = require("datastorage")
+local Device = require("device")
+local Font = require("ui/font")
+local Geom = require("ui/geometry")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
+local InfoMessage = require("ui/widget/infomessage")
+local InputDialog = require("ui/widget/inputdialog")
+local LuaSettings = require("luasettings")
+local PathChooser = require("ui/widget/pathchooser")
+local RenderImage = require("ui/renderimage")
+local SpinWidget = require("ui/widget/spinwidget")
+local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextWidget = require("ui/widget/textwidget")
+local UIManager = require("ui/uimanager")
+local VerticalGroup = require("ui/widget/verticalgroup")
+local VerticalSpan = require("ui/widget/verticalspan")
+local Widget = require("ui/widget/widget")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
+local time = require("ui/time")
+local util = require("util")
+local _ = require("gettext")
+local T = require("ffi/util").template
+local Screen = Device.screen
+
+-- The layout is specified in pixels at this reference width; everything is
+-- scaled by (actual screen width / REF_WIDTH).
+local REF_WIDTH = 824
+
+local REF = {
+    margin = 48,     -- side margins, and padding above/below the panel contents
+    title = 54,
+    author = 34,
+    footer = 34,
+    bar = 20,
+    gap_title = 16,  -- title -> author
+    gap_author = 32, -- author -> bar
+    gap_bar = 20,    -- bar -> footer
+    gap_footer = 24, -- footer <-> chapter, minimum
+    meta = 26,       -- secondary line: chapter count, battery, timestamp
+    gap_meta = 18,   -- footer -> secondary line
+    tick = 2,        -- chapter mark width on the progress bar
+}
+
+-- Panel colour is pulled into this luminance band: the Kaleido 3 colour layer is
+-- 150 PPI and renders near-black and near-white as flat blocks.
+local LUMA_MIN, LUMA_MAX = 70, 135
+-- Minimum WCAG contrast ratio between the panel and its text. Deliberately well
+-- above the 4.5 web threshold: the colour layer washes out mid-tones.
+local MIN_CONTRAST = 6.0
+local MONO_FALLBACK = { r = 0x3A, g = 0x3C, b = 0x42 }
+
+local RENDER_DELAY = 0.5 -- seconds; keeps the work well clear of the page-turn refresh
+
+---------------------------------------------------------------------------
+-- colour helpers
+---------------------------------------------------------------------------
+
+local function clamp8(v)
+    if v < 0 then return 0 end
+    if v > 255 then return 255 end
+    return math.floor(v)
+end
+
+local function luminance(r, g, b)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+end
+
+--- Samples a cover on a coarse grid and returns its dominant colour, pulled
+-- into the mid-lightness band. Returns nil if the cover is effectively
+-- monochrome, so the caller can fall back.
+local function dominantColour(bb)
+    local w, h = bb:getWidth(), bb:getHeight()
+    if w < 2 or h < 2 then return nil end
+
+    local step = math.max(1, math.floor(math.min(w, h) / 48))
+    local buckets = {}
+
+    for y = 0, h - 1, step do
+        for x = 0, w - 1, step do
+            local c = bb:getPixel(x, y):getColorRGB32()
+            local r, g, b = c.r, c.g, c.b
+            -- discard near-white and near-black: they carry no hue and dominate
+            -- the histogram of most covers
+            local mx = math.max(r, g, b)
+            local mn = math.min(r, g, b)
+            if not (mn > 235 or mx < 32) then
+                -- 8 levels per channel
+                local key = math.floor(r / 32) * 64 + math.floor(g / 32) * 8 + math.floor(b / 32)
+                local bucket = buckets[key]
+                if bucket then
+                    bucket.n = bucket.n + 1
+                    bucket.r = bucket.r + r
+                    bucket.g = bucket.g + g
+                    bucket.b = bucket.b + b
+                else
+                    buckets[key] = { n = 1, r = r, g = g, b = b }
+                end
+            end
+        end
+    end
+
+    -- Take the most frequent bucket that actually carries some hue. Picking the
+    -- most frequent bucket outright loses to the large desaturated darks on
+    -- covers like night skies, which would then be rejected as monochrome even
+    -- though the cover has plenty of colour in it.
+    local best, best_count = nil, 0
+    for _key, bucket in pairs(buckets) do
+        local r = bucket.r / bucket.n
+        local g = bucket.g / bucket.n
+        local b = bucket.b / bucket.n
+        if math.max(r, g, b) - math.min(r, g, b) >= 25 and bucket.n > best_count then
+            best_count = bucket.n
+            best = { r = r, g = g, b = b }
+        end
+    end
+
+    -- effectively monochrome: let the caller use the neutral fallback
+    if not best then return nil end
+    local r, g, b = best.r, best.g, best.b
+
+    -- pull toward mid-lightness, preserving the channel ratios
+    local l = luminance(r, g, b)
+    if l > 0 then
+        local target = math.max(LUMA_MIN, math.min(LUMA_MAX, l))
+        local f = target / l
+        r, g, b = r * f, g * f, b * f
+    end
+
+    return { r = clamp8(r), g = clamp8(g), b = clamp8(b) }
+end
+
+local function mix(a, b, t)
+    return {
+        r = clamp8(a.r + (b.r - a.r) * t),
+        g = clamp8(a.g + (b.g - a.g) * t),
+        b = clamp8(a.b + (b.b - a.b) * t),
+    }
+end
+
+local function toColorRGB32(c)
+    return Blitbuffer.ColorRGB32(c.r, c.g, c.b, 0xFF)
+end
+
+-- WCAG relative luminance (sRGB, gamma-decoded), and the contrast ratio built
+-- on it. The simple 0.299/0.587/0.114 average above is fine for picking a
+-- dominant colour but is not a contrast model.
+local function relLuminance(c)
+    local function ch(v)
+        v = v / 255
+        return v <= 0.03928 and v / 12.92 or ((v + 0.055) / 1.055) ^ 2.4
+    end
+    return 0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+end
+
+local function contrastRatio(a, b)
+    local la, lb = relLuminance(a), relLuminance(b)
+    if la < lb then la, lb = lb, la end
+    return (la + 0.05) / (lb + 0.05)
+end
+
+local WHITE = { r = 0xFF, g = 0xFF, b = 0xFF }
+local BLACK = { r = 0x00, g = 0x00, b = 0x00 }
+
+--- Picks black or white text for the panel, then pushes the panel colour away
+-- from it until it clears MIN_CONTRAST. Choosing the text colour alone is not
+-- enough: a mid-lightness panel is too close to both.
+local function ensureContrast(panel)
+    local use_white = contrastRatio(panel, WHITE) >= contrastRatio(panel, BLACK)
+    local target = use_white and BLACK or WHITE -- direction to push the panel
+    local c = { r = panel.r, g = panel.g, b = panel.b }
+    -- 24 steps of 5% is enough to reach either extreme from anywhere
+    for _ = 1, 24 do
+        if contrastRatio(c, use_white and WHITE or BLACK) >= MIN_CONTRAST then break end
+        c = mix(c, target, 0.05)
+    end
+    return c, use_white and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK, use_white
+end
+
+---------------------------------------------------------------------------
+-- progress bar
+---------------------------------------------------------------------------
+
+-- ProgressWidget paints exclusively through bb:paintRect, which collapses any
+-- colour to 8-bit grayscale, so its track would render flat grey over the
+-- coloured panel. This paints through paintRectRGB32 instead.
+local ProgressBar = Widget:extend{
+    width = 0,
+    height = 0,
+    percentage = 0,
+    fill_color = nil,
+    track_color = nil,
+    marks = nil,       -- chapter starts, as fractions of the book
+    mark_color = nil,  -- painted in the panel colour, so a mark reads as a gap
+    mark_width = 2,
+}
+
+function ProgressBar:getSize()
+    return Geom:new{ w = self.width, h = self.height }
+end
+
+function ProgressBar:paintTo(bb, x, y)
+    bb:paintRectRGB32(x, y, self.width, self.height, self.track_color)
+    local filled = math.floor(self.width * self.percentage + 0.5)
+    if filled > 0 then
+        bb:paintRectRGB32(x, y, math.min(filled, self.width), self.height, self.fill_color)
+    end
+    if not self.marks then return end
+    -- Notched into the bottom edge rather than cut full height: a typical book
+    -- has more chapters than the bar is tall in pixels, so full-height cuts turn
+    -- the whole bar into a dashed line. Leaving the top intact keeps it reading
+    -- as one bar with chapter divisions along its foot.
+    local notch = math.max(2, math.floor(self.height * 0.4 + 0.5))
+    for _, frac in ipairs(self.marks) do
+        local mx = math.floor(self.width * frac + 0.5)
+        -- keep the mark inside the bar, and skip one sitting on the very edge
+        if mx > 0 and mx < self.width then
+            if mx + self.mark_width > self.width then mx = self.width - self.mark_width end
+            bb:paintRectRGB32(x + mx, y + self.height - notch,
+                self.mark_width, notch, self.mark_color)
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- battery icon
+---------------------------------------------------------------------------
+
+-- Drawn rather than typeset: KOReader's own footer has no battery glyph, the
+-- bundled Noto faces cannot be relied on for one, and text is greyscale-only
+-- here anyway. Drawing it also lets the fill track the actual charge.
+local BatteryIcon = Widget:extend{
+    height = 0,
+    level = 0, -- 0..1
+    color = nil,
+    stroke = 2,
+}
+
+function BatteryIcon:bodyWidth()
+    return math.floor(self.height * 1.9 + 0.5)
+end
+
+function BatteryIcon:getSize()
+    -- body plus the terminal nub on the right
+    return Geom:new{ w = self:bodyWidth() + math.max(2, math.floor(self.height * 0.16 + 0.5)),
+                     h = self.height }
+end
+
+function BatteryIcon:paintTo(bb, x, y)
+    local w, h, s = self:bodyWidth(), self.height, self.stroke
+    -- shell
+    bb:paintRectRGB32(x, y, w, s, self.color)
+    bb:paintRectRGB32(x, y + h - s, w, s, self.color)
+    bb:paintRectRGB32(x, y, s, h, self.color)
+    bb:paintRectRGB32(x + w - s, y, s, h, self.color)
+    -- terminal
+    local nub_w = math.max(2, math.floor(h * 0.16 + 0.5))
+    local nub_h = math.max(2, math.floor(h * 0.42 + 0.5))
+    bb:paintRectRGB32(x + w, y + math.floor((h - nub_h) / 2), nub_w, nub_h, self.color)
+    -- charge, inset by one stroke plus a hairline of breathing room
+    local pad = s + 1
+    local inner_w = w - 2 * pad
+    local fill = math.floor(inner_w * math.max(0, math.min(1, self.level)) + 0.5)
+    if fill > 0 then
+        bb:paintRectRGB32(x + pad, y + pad, fill, h - 2 * pad, self.color)
+    end
+end
+
+---------------------------------------------------------------------------
+-- plugin
+---------------------------------------------------------------------------
+
+local PalmaSleepScreen = WidgetContainer:extend{
+    name = "palmasleepscreen",
+    is_doc_only = true,
+}
+
+--- The output is always PNG, so the path always ends in .png. Applied on both
+-- read and write, which also repairs a path saved by an earlier version.
+local function normalizeOutputPath(path)
+    if not path or path == "" then return path end
+    local dir, name = util.splitFilePathName(path)
+    if name == "" then return path end
+    return dir .. (name:gsub("%.[^%.]*$", "")) .. ".png"
+end
+
+local function defaultOutputPath()
+    if Device.isAndroid() then
+        local ok, android = pcall(require, "android")
+        if ok and android then
+            return android.getExternalStoragePath() .. "/palma_sleepscreen.png"
+        end
+    end
+    return DataStorage:getDataDir() .. "/palma_sleepscreen.png"
+end
+
+function PalmaSleepScreen:init()
+    self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/palmasleepscreen.lua")
+
+    self.enabled = self.settings:nilOrTrue("enabled")
+    self.output_path = normalizeOutputPath(self.settings:readSetting("output_path")) or defaultOutputPath()
+    -- Default is per-chapter, not per-page: a full-screen PNG of photographic
+    -- cover art costs ~170 ms to encode here and several times that on device,
+    -- which is too much to spend on every page turn.
+    self.trigger = self.settings:readSetting("trigger") or "chapter"
+    self.interval = self.settings:readSetting("interval") or 10
+    self.text_scale = self.settings:readSetting("text_scale") or 1.0
+    self.render_on_suspend = self.settings:isTrue("render_on_suspend")
+    self.debug = self.settings:isTrue("debug")
+
+    self.render_pending = false
+    self.pages_since_render = 0
+    self.last_chapter_idx = nil
+    self.prepared = nil
+
+    -- stable reference so it can be unscheduled
+    self.deferred_render = function()
+        self.render_pending = false
+        self:render()
+    end
+
+    self.ui.menu:registerToMainMenu(self)
+end
+
+function PalmaSleepScreen:onCloseWidget()
+    UIManager:unschedule(self.deferred_render)
+    self:releasePrepared()
+end
+
+function PalmaSleepScreen:saveSetting(key, value)
+    self[key] = value
+    self.settings:saveSetting(key, value)
+    self.settings:flush()
+end
+
+---------------------------------------------------------------------------
+-- output path
+---------------------------------------------------------------------------
+
+--- Returns true, or false plus a human-readable reason.
+-- Android declares MANAGE_EXTERNAL_STORAGE, but it is a runtime grant the user
+-- may not have given, so probe with a real write rather than trusting the path.
+function PalmaSleepScreen:checkOutputPath(path)
+    if not path or path == "" then
+        return false, _("No output path is set.")
+    end
+    local dir, name = util.splitFilePathName(path)
+    if name == "" then
+        return false, _("The output path has no filename.")
+    end
+    if lfs.attributes(dir, "mode") ~= "directory" then
+        return false, T(_("The folder does not exist:\n%1"), dir)
+    end
+    local probe = path .. ".probe"
+    local fh = io.open(probe, "wb")
+    if not fh then
+        local reason = _("The folder is not writable:\n%1")
+        if Device.isAndroid() then
+            reason = _("The folder is not writable:\n%1\n\nOn Android, grant KOReader \"All files access\" in the system app settings.")
+        end
+        return false, T(reason, dir)
+    end
+    fh:write("x")
+    fh:close()
+    os.remove(probe)
+    return true
+end
+
+---------------------------------------------------------------------------
+-- layout
+---------------------------------------------------------------------------
+
+function PalmaSleepScreen:metrics()
+    local screen_w = Screen:getWidth()
+    local unit = screen_w / REF_WIDTH
+    -- Font:getFace() runs its size through Screen:scaleBySize(), so divide it
+    -- back out to land on the pixel sizes the layout is specified in
+    local face_scale = Screen:scaleBySize(1000) / 1000
+
+    local m = {
+        screen_w = screen_w,
+        screen_h = Screen:getHeight(),
+        unit = unit,
+        face_scale = face_scale,
+    }
+    for key, px in pairs(REF) do
+        m[key] = math.floor(px * unit + 0.5)
+    end
+    -- text scale applies to the type, not to the margins
+    for _i, key in ipairs({ "title", "author", "footer", "meta" }) do
+        m[key] = math.floor(REF[key] * unit * self.text_scale + 0.5)
+    end
+    return m
+end
+
+function PalmaSleepScreen:face(name, px, m)
+    return Font:getFace(name, math.max(8, math.floor(px / m.face_scale + 0.5)))
+end
+
+function PalmaSleepScreen:bookData()
+    local props = self.ui.doc_props or {}
+    local data = {
+        title = props.display_title or props.title,
+        author = props.authors,
+        series = props.series,
+        series_index = props.series_index,
+    }
+
+    local page = self.ui.view and self.ui.view.state and self.ui.view.state.page
+    local total = self.ui.document and self.ui.document:getPageCount() or 0
+    if page and total > 0 then
+        data.percentage = math.max(0, math.min(1, page / total))
+    else
+        data.percentage = 0
+    end
+
+    if page and self.ui.toc then
+        local chapter = self.ui.toc:getTocTitleByPage(page)
+        if chapter and chapter ~= "" then
+            data.chapter = chapter
+        end
+        -- Chapter N of M, counted off the flattened ticks so that the index and
+        -- the total come from the same list (the raw ToC index counts sub-levels
+        -- and would not agree with the number of chapters).
+        local ok, ticks = pcall(function() return self.ui.toc:getTocTicksFlattened() end)
+        if ok and ticks and #ticks > 0 then
+            local n = 0
+            for _, tick in ipairs(ticks) do
+                if tick <= page then n = n + 1 else break end
+            end
+            data.chapter_num = math.max(1, n)
+            data.chapter_total = #ticks
+            if total > 0 then
+                local marks = {}
+                for _, tick in ipairs(ticks) do
+                    if tick > 1 and tick <= total then
+                        table.insert(marks, tick / total)
+                    end
+                end
+                if #marks > 0 then data.chapter_marks = marks end
+            end
+        end
+    end
+
+    -- Time left to finish the book. Comes from the statistics plugin's running
+    -- average, so it is absent when statistics are disabled -- in which case the
+    -- field is simply hidden.
+    if page and self.ui.statistics and self.ui.document then
+        local ok, left = pcall(function()
+            return self.ui.statistics:getTimeForPages(self.ui.document:getTotalPagesLeft(page))
+        end)
+        if ok and left and left ~= "" then
+            data.time_left = left
+        end
+    end
+
+    local ok_bat, capacity = pcall(function()
+        return Device:getPowerDevice():getCapacity()
+    end)
+    if ok_bat and capacity and capacity > 0 then
+        data.battery = capacity
+    end
+    data.stamp = os.date("%d %b %H:%M")
+
+    return data
+end
+
+--- Author and series on one line; either half may be missing.
+local function bylineText(data)
+    local series = data.series
+    if series and data.series_index then
+        series = string.format("%s #%s", series, tostring(data.series_index))
+    end
+    if data.author and series then
+        return data.author .. "  ·  " .. series
+    end
+    return data.author or series
+end
+
+--- Builds the panel contents as a VerticalGroup of the given width. The caller
+-- must :free() the result. `data` may be nil for the measuring pass.
+function PalmaSleepScreen:buildPanel(width, m, fg, panel_color, data)
+    local group = VerticalGroup:new{ align = "left" }
+
+    -- Title, up to two lines then ellipsized. Unlike TextWidget, TextBoxWidget
+    -- renders into its own buffer and blits it opaquely, so it needs the panel
+    -- colour as bgcolor or it paints a solid block over the panel.
+    local bg = toColorRGB32(panel_color)
+    local title_text = data.title or _("Unknown title")
+    local title_face = self:face("tfont", m.title, m)
+    local title = TextBoxWidget:new{
+        text = title_text,
+        face = title_face,
+        width = width,
+        alignment = "left",
+        fgcolor = fg,
+        bgcolor = bg,
+    }
+    local max_h = 2 * title.line_height_px
+    if title:getSize().h > max_h then
+        title:free()
+        title = TextBoxWidget:new{
+            text = title_text,
+            face = title_face,
+            width = width,
+            height = max_h,
+            height_overflow_show_ellipsis = true,
+            alignment = "left",
+            fgcolor = fg,
+            bgcolor = bg,
+        }
+    end
+    table.insert(group, title)
+
+    local byline = bylineText(data)
+    if byline then
+        table.insert(group, VerticalSpan:new{ width = m.gap_title })
+        table.insert(group, TextWidget:new{
+            text = byline,
+            face = self:face("cfont", m.author, m),
+            max_width = width,
+            fgcolor = fg,
+        })
+    end
+
+    table.insert(group, VerticalSpan:new{ width = m.gap_author })
+    table.insert(group, ProgressBar:new{
+        width = width,
+        height = m.bar,
+        percentage = data.percentage,
+        fill_color = fg,
+        track_color = toColorRGB32(mix(panel_color, { r = fg.a, g = fg.a, b = fg.a }, 0.42)),
+        marks = data.chapter_marks,
+        mark_color = toColorRGB32(panel_color),
+        mark_width = m.tick,
+    })
+
+    table.insert(group, VerticalSpan:new{ width = m.gap_bar })
+
+    -- A row with one item pinned left and one pinned right. Both sides take
+    -- either a string or a ready-made widget; a string on the right is truncated
+    -- to whatever space is left.
+    local function splitRow(left_item, right_item, face)
+        local left = type(left_item) == "string"
+            and TextWidget:new{ text = left_item, face = face, fgcolor = fg } or left_item
+        local row = HorizontalGroup:new{ align = "center", left }
+        if right_item then
+            local left_w = left:getSize().w
+            local right = type(right_item) == "string"
+                and TextWidget:new{
+                    text = right_item,
+                    face = face,
+                    max_width = math.max(0, width - left_w - m.gap_footer),
+                    fgcolor = fg,
+                } or right_item
+            local spacer = width - left_w - right:getSize().w
+            if spacer < m.gap_footer then spacer = m.gap_footer end
+            table.insert(row, HorizontalSpan:new{ width = spacer })
+            table.insert(row, right)
+        end
+        return row
+    end
+
+    -- Primary footer: percentage left, chapter name right. The chapter name gets
+    -- the whole remaining width -- it is the most useful thing here, and putting
+    -- anything else on this row truncates it hard.
+    local chapter_label = data.chapter
+    if data.chapter_num and data.chapter_total then
+        chapter_label = T(_("Chapter %1 / %2"), data.chapter_num, data.chapter_total)
+    end
+    table.insert(group, splitRow(
+        string.format("%d%%", math.floor(data.percentage * 100 + 0.5)),
+        chapter_label, self:face("cfont", m.footer, m)))
+
+    -- Secondary line: time left and chapter count on the left, battery and
+    -- timestamp on the right. Deliberately smaller and last so it stays out of
+    -- the way of what is actually being read.
+    -- It cannot be dimmed instead: TextWidget collapses any fgcolor to greyscale
+    -- (colorblitFrom -> getColor8A), so a tint would render as flat grey on the
+    -- coloured panel. Size and position carry the hierarchy instead.
+    local meta_face = self:face("cfont", m.meta, m)
+    local meta_left = {}
+    if data.time_left then
+        table.insert(meta_left, T(_("%1 left"), data.time_left))
+    end
+
+    -- Right side is a group so the drawn battery icon can sit inline with the
+    -- text; everything after it is plain text again.
+    local meta_right, has_right = HorizontalGroup:new{ align = "center" }, false
+    if data.battery then
+        table.insert(meta_right, BatteryIcon:new{
+            height = math.max(8, math.floor(m.meta * 0.62 + 0.5)),
+            level = data.battery / 100,
+            color = toColorRGB32({ r = fg.a, g = fg.a, b = fg.a }),
+            stroke = math.max(1, math.floor(m.meta * 0.075 + 0.5)),
+        })
+        table.insert(meta_right, HorizontalSpan:new{ width = math.floor(m.meta * 0.30 + 0.5) })
+        table.insert(meta_right, TextWidget:new{
+            text = string.format("%d%%", data.battery), face = meta_face, fgcolor = fg,
+        })
+        has_right = true
+    end
+    if data.stamp then
+        if has_right then
+            table.insert(meta_right, TextWidget:new{
+                text = "  ·  ", face = meta_face, fgcolor = fg,
+            })
+        end
+        table.insert(meta_right, TextWidget:new{
+            text = data.stamp, face = meta_face, fgcolor = fg,
+        })
+        has_right = true
+    end
+
+    if #meta_left > 0 or has_right then
+        table.insert(group, VerticalSpan:new{ width = m.gap_meta })
+        table.insert(group, splitRow(table.concat(meta_left, "  ·  "),
+            has_right and meta_right or nil, meta_face))
+    end
+
+    return group
+end
+
+---------------------------------------------------------------------------
+-- preparation (cached per book)
+---------------------------------------------------------------------------
+
+function PalmaSleepScreen:releasePrepared()
+    if self.prepared and self.prepared.cover_bb then
+        self.prepared.cover_bb:free()
+    end
+    self.prepared = nil
+end
+
+--- Decodes the cover, samples its dominant colour, and works out the cover
+-- geometry. All of this is invariant for a given book and text scale, so it is
+-- cached; only the panel contents are rebuilt per render.
+function PalmaSleepScreen:prepare(m, data)
+    local key = string.format("%s|%s|%dx%d", tostring(self.ui.document and self.ui.document.file),
+        tostring(self.text_scale), m.screen_w, m.screen_h)
+    if self.prepared and self.prepared.key == key then
+        return self.prepared
+    end
+    self:releasePrepared()
+
+    local cover_bb
+    if self.ui.bookinfo and self.ui.document then
+        cover_bb = self.ui.bookinfo:getCoverImage(self.ui.document)
+    end
+
+    local panel_color = cover_bb and dominantColour(cover_bb) or nil
+    if not panel_color then
+        panel_color = MONO_FALLBACK
+    end
+
+    local fg
+    panel_color, fg = ensureContrast(panel_color)
+
+    -- measure the panel at this text scale to get the minimum viable height
+    local panel_w = m.screen_w - 2 * m.margin
+    local probe = self:buildPanel(panel_w, m, fg, panel_color, data)
+    local min_panel = probe:getSize().h + 2 * m.margin
+    probe:free()
+
+    local prepared = {
+        key = key,
+        panel_color = panel_color,
+        panel_color_rgb = toColorRGB32(panel_color),
+        fg = fg,
+        min_panel = min_panel,
+        panel_w = panel_w,
+    }
+
+    if cover_bb then
+        local iw, ih = cover_bb:getWidth(), cover_bb:getHeight()
+        local max_cover_h = m.screen_h - min_panel
+        if iw > 0 and ih > 0 and max_cover_h > 0 then
+            local cover_w = m.screen_w
+            local cover_h = math.floor(ih * (cover_w / iw) + 0.5)
+            if cover_h > max_cover_h then
+                -- Tall cover: scale it down until the panel reaches min_panel and
+                -- centre it horizontally. This is the one case where the cover is
+                -- not full width, and it beats cropping.
+                cover_h = max_cover_h
+                cover_w = math.floor(iw * (cover_h / ih) + 0.5)
+            end
+            prepared.cover_bb = RenderImage:scaleBlitBuffer(cover_bb, cover_w, cover_h, true)
+            prepared.cover_w = cover_w
+            prepared.cover_h = cover_h
+            prepared.cover_x = math.floor((m.screen_w - cover_w) / 2)
+        else
+            cover_bb:free()
+        end
+    end
+
+    self.prepared = prepared
+    return prepared
+end
+
+---------------------------------------------------------------------------
+-- render
+---------------------------------------------------------------------------
+
+--- Renders, returning ok plus a reason on failure.
+-- `interactive` reports the outcome in the UI either way; automatic renders
+-- report only the first failure, so a bad path can't fail silently forever but
+-- also can't nag on every page turn.
+function PalmaSleepScreen:render(interactive)
+    if not self.enabled or not self.ui or not self.ui.document then
+        if interactive then
+            UIManager:show(InfoMessage:new{
+                text = not self.enabled and _("The sleep screen is disabled.")
+                    or _("No document is open."),
+                show_icon = true,
+            })
+        end
+        return false
+    end
+
+    local start = time.now()
+    local ok, err = pcall(function() self:doRender() end)
+    local ms = time.to_ms(time.since(start))
+
+    if not ok then
+        logger.warn("PalmaSleepScreen: render failed:", err)
+        if interactive or not self.warned_failure then
+            self.warned_failure = true
+            UIManager:show(InfoMessage:new{
+                text = T(_("Could not write the sleep screen:\n\n%1"), tostring(err)),
+                show_icon = true,
+            })
+        end
+        return false, err
+    end
+
+    self.warned_failure = false
+    if self.debug then
+        logger.info(string.format("PalmaSleepScreen: render took %.1f ms", ms))
+    end
+    if interactive then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Sleep screen updated (%1 ms):\n%2"), math.floor(ms + 0.5), self.output_path),
+            timeout = 3,
+        })
+    end
+    return true
+end
+
+function PalmaSleepScreen:doRender()
+    local m = self:metrics()
+    local data = self:bookData()
+    local p = self:prepare(m, data)
+
+    local bb = Blitbuffer.new(m.screen_w, m.screen_h, Blitbuffer.TYPE_BBRGB32)
+    bb:paintRectRGB32(0, 0, m.screen_w, m.screen_h, p.panel_color_rgb)
+
+    local panel_top
+    if p.cover_bb then
+        bb:blitFrom(p.cover_bb, p.cover_x, 0, 0, 0, p.cover_w, p.cover_h)
+        panel_top = p.cover_h + m.margin
+    else
+        -- No cover: the panel is the whole screen, contents centred.
+        panel_top = nil
+    end
+
+    local panel = self:buildPanel(p.panel_w, m, p.fg, p.panel_color, data)
+    if panel_top == nil then
+        panel_top = math.floor((m.screen_h - panel:getSize().h) / 2)
+    end
+    -- Padding stays constant at the top of the panel; any extra space falls at
+    -- the bottom, so the text keeps a fixed distance below the cover edge.
+    panel:paintTo(bb, m.margin, panel_top)
+    panel:free()
+
+    -- never leave a partial image at the output path
+    local tmp = self.output_path .. ".tmp"
+    local written = bb:writeToFile(tmp, "png")
+    bb:free()
+
+    -- Blitbuffer:writePNG() discards the return value of Png.encodeToFile(), so
+    -- writeToFile() reports success even when nothing reached the disk. Check
+    -- the file itself rather than trusting it.
+    local size = lfs.attributes(tmp, "size")
+    if not written or not size or size == 0 then
+        os.remove(tmp)
+        local dir = util.splitFilePathName(self.output_path)
+        local hint = ""
+        if lfs.attributes(dir, "mode") ~= "directory" then
+            hint = "\n" .. T(_("The folder does not exist: %1"), dir)
+        elseif Device.isAndroid() then
+            hint = "\n" .. _("On Android, grant KOReader \"All files access\" in the system app settings.")
+        end
+        error(T(_("could not write %1"), tmp) .. hint, 0)
+    end
+
+    local ok, rename_err = os.rename(tmp, self.output_path)
+    if not ok then
+        os.remove(tmp)
+        error(T(_("could not rename onto %1: %2"), self.output_path, tostring(rename_err)), 0)
+    end
+end
+
+--- Coalescing request: if a render is already queued, drop this one. The
+-- scheduled render reads current state when it fires, so nothing is lost.
+function PalmaSleepScreen:requestRender()
+    if not self.enabled then return end
+    if self.render_pending then return end
+    self.render_pending = true
+    UIManager:scheduleIn(RENDER_DELAY, self.deferred_render)
+end
+
+---------------------------------------------------------------------------
+-- triggers
+---------------------------------------------------------------------------
+
+function PalmaSleepScreen:onReaderReady()
+    self:releasePrepared()
+    self.pages_since_render = 0
+    self.last_chapter_idx = nil
+    self:requestRender()
+end
+
+function PalmaSleepScreen:onPageUpdate(pageno)
+    if not self.enabled then return end
+
+    if self.trigger == "chapter" then
+        local idx = self.ui.toc and self.ui.toc:getTocIndexByPage(pageno) or 0
+        if idx ~= self.last_chapter_idx then
+            self.last_chapter_idx = idx
+            self:requestRender()
+        end
+    elseif self.trigger == "interval" then
+        self.pages_since_render = self.pages_since_render + 1
+        if self.pages_since_render >= self.interval then
+            self.pages_since_render = 0
+            self:requestRender()
+        end
+    else
+        self:requestRender()
+    end
+end
+
+--- Rendered inline, not scheduled: there is no time left once the device is
+-- going down. Note this only ever *freshens* an already-current image — see the
+-- menu help for why it cannot be relied on by itself.
+function PalmaSleepScreen:renderOnSuspend()
+    if not self.enabled or not self.render_on_suspend then return end
+    UIManager:unschedule(self.deferred_render)
+    self.render_pending = false
+    self:render()
+end
+
+-- generic devices (Device:suspend), and Android's APP_CMD_PAUSE
+PalmaSleepScreen.onSuspend = PalmaSleepScreen.renderOnSuspend
+PalmaSleepScreen.onRequestSuspend = PalmaSleepScreen.renderOnSuspend
+
+function PalmaSleepScreen:onCloseDocument()
+    -- render inline: the document is about to go away, so a scheduled render
+    -- would find nothing to read
+    UIManager:unschedule(self.deferred_render)
+    self.render_pending = false
+    self:render()
+    self:releasePrepared()
+end
+
+---------------------------------------------------------------------------
+-- menu
+---------------------------------------------------------------------------
+
+function PalmaSleepScreen:chooseOutputPath(touchmenu_instance)
+    local dir = util.splitFilePathName(self.output_path)
+    UIManager:show(PathChooser:new{
+        select_directory = true,
+        select_file = false,
+        height = Screen:getHeight(),
+        path = dir,
+        onConfirm = function(dir_path)
+            local _dir, name = util.splitFilePathName(self.output_path)
+            local input
+            input = InputDialog:new{
+                title = _("Filename"),
+                input = dir_path:gsub("/$", "") .. "/" .. (name ~= "" and name or "palma_sleepscreen.png"),
+                buttons = {{
+                    {
+                        text = _("Cancel"),
+                        id = "close",
+                        callback = function() UIManager:close(input) end,
+                    },
+                    {
+                        text = _("Save"),
+                        callback = function()
+                            local path = normalizeOutputPath(input:getInputText())
+                            local ok, reason = self:checkOutputPath(path)
+                            if not ok then
+                                UIManager:show(InfoMessage:new{ text = reason, show_icon = true })
+                                return
+                            end
+                            UIManager:close(input)
+                            self:saveSetting("output_path", path)
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:requestRender()
+                        end,
+                    },
+                }},
+            }
+            UIManager:show(input)
+            input:onShowKeyboard()
+        end,
+    })
+end
+
+function PalmaSleepScreen:menuEntryTrigger(mode, label)
+    return {
+        text = label,
+        checked_func = function() return self.trigger == mode end,
+        radio = true,
+        callback = function()
+            self:saveSetting("trigger", mode)
+            self.pages_since_render = 0
+            self.last_chapter_idx = nil
+            self:requestRender()
+        end,
+    }
+end
+
+function PalmaSleepScreen:menuEntryTextScale(scale, label)
+    return {
+        text = label,
+        checked_func = function() return self.text_scale == scale end,
+        radio = true,
+        callback = function()
+            self:saveSetting("text_scale", scale)
+            self:releasePrepared()
+            self:requestRender()
+        end,
+    }
+end
+
+function PalmaSleepScreen:addToMainMenu(menu_items)
+    menu_items.palmasleepscreen = {
+        sorting_hint = "screen",
+        text = _("Palma sleep screen"),
+        checked_func = function() return self.enabled end,
+        sub_item_table = {
+            {
+                text = _("Enabled"),
+                checked_func = function() return self.enabled end,
+                callback = function()
+                    self:saveSetting("enabled", not self.enabled)
+                    if self.enabled then self:requestRender() end
+                end,
+                separator = true,
+            },
+            {
+                text_func = function()
+                    return T(_("Output file: %1"), self.output_path)
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:chooseOutputPath(touchmenu_instance)
+                end,
+            },
+            {
+                text = _("Check output path"),
+                keep_menu_open = true,
+                callback = function()
+                    local ok, reason = self:checkOutputPath(self.output_path)
+                    UIManager:show(InfoMessage:new{
+                        text = ok and T(_("The output path is writable:\n%1"), self.output_path) or reason,
+                        show_icon = true,
+                    })
+                end,
+                separator = true,
+            },
+            {
+                text = _("Update"),
+                sub_item_table = {
+                    self:menuEntryTrigger("page", _("Every page")),
+                    self:menuEntryTrigger("chapter", _("Every chapter")),
+                    self:menuEntryTrigger("interval", _("Every N pages")),
+                    {
+                        text = _("Also update when the device sleeps"),
+                        help_text = _([[Renders once more as the device suspends.
+
+This can only freshen an image that is already up to date. The system reads the sleep screen file as it goes to sleep, and usually gets there before the render finishes — so on its own this shows the previous image, not the current one. Leave a page or chapter trigger enabled as well.]]),
+                        checked_func = function() return self.render_on_suspend end,
+                        callback = function()
+                            self:saveSetting("render_on_suspend", not self.render_on_suspend)
+                        end,
+                        separator = true,
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Pages between updates: %1"), self.interval)
+                        end,
+                        enabled_func = function() return self.trigger == "interval" end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            UIManager:show(SpinWidget:new{
+                                value = self.interval,
+                                value_min = 1,
+                                value_max = 50,
+                                default_value = 10,
+                                title_text = _("Pages between updates"),
+                                ok_text = _("Set"),
+                                callback = function(spin)
+                                    self:saveSetting("interval", spin.value)
+                                    self.pages_since_render = 0
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            })
+                        end,
+                    },
+                },
+            },
+            {
+                text = _("Text size"),
+                sub_item_table = {
+                    self:menuEntryTextScale(0.8, _("Small")),
+                    self:menuEntryTextScale(1.0, _("Medium")),
+                    self:menuEntryTextScale(1.2, _("Large")),
+                },
+                separator = true,
+            },
+            {
+                text = _("Refresh now"),
+                keep_menu_open = true,
+                callback = function() self:render(true) end,
+            },
+            {
+                text = _("Log render timings"),
+                checked_func = function() return self.debug end,
+                callback = function() self:saveSetting("debug", not self.debug) end,
+            },
+        },
+    }
+end
+
+return PalmaSleepScreen
