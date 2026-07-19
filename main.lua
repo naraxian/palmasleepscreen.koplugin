@@ -202,17 +202,31 @@ end
 -- luminance detail resolves at twice the resolution of chroma, and the filter
 -- absorbs enough light that untouched sRGB art reads dark and washed out.
 --
--- Hence the luma/chroma split below: the tone curve and the unsharp mask act on
--- luminance alone -- sharpening the layer that can actually resolve it, with no
--- colour fringing -- while saturation scales the chroma offsets around it.
+-- Hence the luma/chroma split below: luminance is taken sharp from the original
+-- and carries the tone curve and the unsharp mask, while chroma is taken from a
+-- blurred copy. Detail lands on the layer that can resolve it, and colour is fed
+-- to the layer that cannot as a smooth wash.
+--
+-- Blurring chroma is not just free, it is the point. The panel dithers to reach
+-- colours it cannot render directly, and low-amplitude chroma variation across a
+-- smooth gradient -- a dusk sky, water -- dithers into visible magenta/green
+-- speckle. Smoothing chroma before it ever reaches the dither removes the input
+-- that produces the speckle, and the neutral gate below drops near-grey pixels
+-- to true grey so they render on the monochrome layer alone.
+--
+-- This is also why saturation cannot be applied flat: multiplying all chroma by
+-- 1.6 amplifies exactly the near-neutral noise that speckles worst. The gate
+-- makes the boost proportional to how much colour a pixel actually has.
 local ENHANCE_DEFAULTS = {
-    saturation = 1.6,  -- chroma multiplier, compensating for the filter array
-    brightness = 1.05, -- gamma; above 1 lifts the midtones
-    contrast = 0.25,   -- blend toward a smoothstep S-curve; 0 is off
-    sharpness = 0.8,   -- unsharp mask amount, on luminance only
+    saturation = 1.6,   -- chroma multiplier, compensating for the filter array
+    brightness = 1.05,  -- gamma; above 1 lifts the midtones
+    contrast = 0.25,    -- blend toward a smoothstep S-curve; 0 is off
+    sharpness = 0.8,    -- unsharp mask amount, on luminance only
+    chroma_blur = 2,    -- radius of the chroma low-pass, in pixels; 0 is off
+    neutral_gate = 12,  -- chroma below this fades to grey; 0 is off
 }
 -- Bump when the pipeline changes shape, to invalidate every cached cover.
-local ENHANCE_VERSION = 1
+local ENHANCE_VERSION = 2
 local SHARPEN_RADIUS = 2
 
 --- Separable box blur over an 8-bit plane. Only ever feeds the unsharp mask, so
@@ -242,20 +256,38 @@ local function boxBlur(src, dst, w, h, r)
     end
 end
 
---- Applies the tone curve, unsharp mask and saturation boost to `bb` in place.
--- `bb` must be TYPE_BBRGB32.
+--- Applies the tone curve, unsharp mask, chroma smoothing and saturation boost
+-- to `bb` in place. `bb` must be TYPE_BBRGB32.
 local function enhanceCover(bb, p)
     local w, h = bb:getWidth(), bb:getHeight()
     if w < 3 or h < 3 then return end
     local n = w * h
 
+    -- Luminance stays at full resolution; the RGB copy is what gets blurred, and
+    -- chroma is read back out of it. Blurring RGB rather than chroma directly
+    -- costs one plane less and gives the same offsets once its own luma is
+    -- subtracted back off.
     local luma = ffi.new("uint8_t[?]", n)
+    local cr = ffi.new("uint8_t[?]", n)
+    local cg = ffi.new("uint8_t[?]", n)
+    local cb = ffi.new("uint8_t[?]", n)
     for y = 0, h - 1 do
         local row = y * w
         for x = 0, w - 1 do
+            local i = row + x
             local px = bb:getPixelP(x, y)
-            luma[row + x] = luminance(px.r, px.g, px.b)
+            local r, g, b = px.r, px.g, px.b
+            luma[i] = luminance(r, g, b)
+            cr[i], cg[i], cb[i] = r, g, b
         end
+    end
+
+    -- boxBlur reads its input fully into a scratch plane before writing, so the
+    -- destination may alias the source.
+    if p.chroma_blur > 0 then
+        boxBlur(cr, cr, w, h, p.chroma_blur)
+        boxBlur(cg, cg, w, h, p.chroma_blur)
+        boxBlur(cb, cb, w, h, p.chroma_blur)
     end
 
     local blur
@@ -275,22 +307,43 @@ local function enhanceCover(bb, p)
         curve[i] = clamp8(v * 255 + 0.5)
     end
 
+    local gate = p.neutral_gate
     for y = 0, h - 1 do
         local row = y * w
         for x = 0, w - 1 do
             local i = row + x
             local px = bb:getPixelP(x, y)
+
             local l = luma[i]
             local sharp = l
             if blur then
                 sharp = clamp8(l + (l - blur[i]) * p.sharpness)
             end
-            -- New luminance, with the original chroma offsets scaled around it.
             local l2 = curve[sharp]
-            local r, g, b = px.r, px.g, px.b
-            px.r = clamp8(l2 + (r - l) * p.saturation)
-            px.g = clamp8(l2 + (g - l) * p.saturation)
-            px.b = clamp8(l2 + (b - l) * p.saturation)
+
+            -- chroma offsets, taken around the blurred copy's own luminance
+            local sr, sg, sb = cr[i], cg[i], cb[i]
+            local sl = 0.299 * sr + 0.587 * sg + 0.114 * sb
+            local dr, dg, db = sr - sl, sg - sl, sb - sl
+
+            -- Saturation, faded out across the gate so near-neutral pixels land
+            -- on true grey instead of being amplified into dither speckle.
+            -- Smoothstep, not a hard cut: a threshold would band a gradient at
+            -- whatever contour crosses it.
+            local gain = p.saturation
+            if gate > 0 then
+                local hi = dr > dg and dr or dg; if db > hi then hi = db end
+                local lo = dr < dg and dr or dg; if db < lo then lo = db end
+                local c = hi - lo
+                if c < gate then
+                    local t = c / gate
+                    gain = gain * t * t * (3 - 2 * t)
+                end
+            end
+
+            px.r = clamp8(l2 + dr * gain)
+            px.g = clamp8(l2 + dg * gain)
+            px.b = clamp8(l2 + db * gain)
         end
     end
 end
@@ -1182,10 +1235,11 @@ end
 
 --- A spinner over one enhancement parameter. Any change invalidates every
 -- cached cover, since the parameters are part of the cache key.
-function PalmaSleepScreen:menuEntryEnhanceParam(key, label, min, max, step)
+function PalmaSleepScreen:menuEntryEnhanceParam(key, label, min, max, step, precision)
+    precision = precision or "%.2f"
     return {
         text_func = function()
-            return T(_("%1: %2"), label, string.format("%.2f", self.enhance_params[key]))
+            return T(_("%1: %2"), label, string.format(precision, self.enhance_params[key]))
         end,
         enabled_func = function() return self.enhance end,
         keep_menu_open = true,
@@ -1318,6 +1372,8 @@ For use with the Boox system status bar, which draws its own clock and battery o
 
 Brightness, contrast and sharpness act on luminance only, so sharpening picks up the full resolution of the monochrome layer without colouring the edges. Saturation compensates for the colour filter.
 
+Colour smoothing and the neutral threshold work against dither speckle: the panel dithers to reach colours it cannot render, and faint colour variation across a smooth gradient turns into magenta and green flecks. Smoothing the colour, and dropping near-grey pixels to true grey, removes what the dithering feeds on. Raise both if covers look speckled; lower them if colour looks smeared.
+
 The result is cached, so the work is done once per book rather than on every update.]]),
                 sub_item_table = {
                     {
@@ -1334,6 +1390,8 @@ The result is cached, so the work is done once per book rather than on every upd
                     self:menuEntryEnhanceParam("brightness", _("Brightness"), 0.7, 1.5, 0.05),
                     self:menuEntryEnhanceParam("contrast", _("Contrast"), 0.0, 1.0, 0.05),
                     self:menuEntryEnhanceParam("sharpness", _("Sharpness"), 0.0, 2.0, 0.1),
+                    self:menuEntryEnhanceParam("chroma_blur", _("Colour smoothing"), 0, 6, 1, "%d"),
+                    self:menuEntryEnhanceParam("neutral_gate", _("Neutral threshold"), 0, 40, 2, "%d"),
                     {
                         text = _("Rebuild cached covers"),
                         keep_menu_open = true,

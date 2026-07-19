@@ -95,8 +95,15 @@ layer runs at the full 300 PPI, the colour filter array over it at 150. Colour
 therefore resolves at half the detail of luminance, and the filter absorbs
 enough light that an untouched sRGB cover reads dark and washed out.
 
-The enhancement splits the cover into luminance and chroma and treats them
-separately:
+There is a second artifact on top of that. The panel dithers to reach colours it
+cannot render directly, and faint colour variation across a smooth gradient — a
+dusk sky, water — dithers into visible magenta and green speckle. This is what
+Boox's own "Image Smoothing" toggle suppresses in NeoReader; it does not reach
+the sleep screen, so the plugin has to handle it itself.
+
+So the enhancement takes **luminance sharp from the original and chroma from a
+blurred copy**: detail lands on the layer that can resolve it, and colour reaches
+the layer that cannot as a smooth wash with nothing for the dither to fleck.
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
@@ -104,6 +111,12 @@ separately:
 | **Brightness** | 1.05 | Gamma on luminance; above 1 lifts the midtones. |
 | **Contrast** | 0.25 | Blends luminance toward a smoothstep S-curve. 0 is off. |
 | **Sharpness** | 0.80 | Unsharp mask on luminance only, so edges pick up the full 300 PPI of the monochrome layer without colour fringing. |
+| **Colour smoothing** | 2 | Radius of the chroma low-pass, in pixels. Raise if covers look speckled, lower if colour looks smeared. 0 is off. |
+| **Neutral threshold** | 12 | Chroma below this fades to true grey, so near-neutral gradients render on the monochrome layer alone. 0 is off. |
+
+Saturation is faded in across the neutral threshold rather than applied flat —
+a flat multiplier amplifies precisely the near-neutral noise that speckles
+worst, making the problem worse rather than better.
 
 Defaults are a starting point, not a calibration — they were chosen from how the
 panel behaves, not measured against one. Expect to tune them by eye.
