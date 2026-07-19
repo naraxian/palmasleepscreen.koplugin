@@ -15,6 +15,7 @@ local Font = require("ui/font")
 local Geom = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
+local ImageViewer = require("ui/widget/imageviewer")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local LuaSettings = require("luasettings")
@@ -392,6 +393,20 @@ function BatteryIcon:paintTo(bb, x, y)
     if fill > 0 then
         bb:paintRectRGB32(x + pad, y + pad, fill, h - 2 * pad, self.color)
     end
+end
+
+---------------------------------------------------------------------------
+-- preview
+---------------------------------------------------------------------------
+
+-- ImageViewer only closes on a tap that lands outside its frame, and in
+-- fullscreen there is no outside -- a tap there toggles the button bar instead.
+-- The preview is a look, not a workspace, so any tap closes it.
+local PreviewViewer = ImageViewer:extend{}
+
+function PreviewViewer:onTap()
+    self:onClose()
+    return true
 end
 
 ---------------------------------------------------------------------------
@@ -1334,6 +1349,32 @@ The result is cached, so the work is done once per book rather than on every upd
                     },
                 },
                 separator = true,
+            },
+            {
+                text = _("Preview"),
+                help_text = _("Renders the sleep screen and shows it full screen, exactly as written. Tap anywhere to close."),
+                callback = function()
+                    if not self.enabled or not self.ui or not self.ui.document then
+                        UIManager:show(InfoMessage:new{
+                            text = not self.enabled and _("The sleep screen is disabled.")
+                                or _("No document is open."),
+                            show_icon = true,
+                        })
+                        return
+                    end
+                    -- render inline so the preview is the current state, and so a
+                    -- queued render cannot overwrite the file behind the viewer
+                    UIManager:unschedule(self.deferred_render)
+                    self.render_pending = false
+                    if not self:render() then return end -- render reports its own failure
+                    -- Shows the written file rather than the buffer it came from:
+                    -- a preview that skipped the encode could not catch a bad write.
+                    UIManager:show(PreviewViewer:new{
+                        file = self.output_path,
+                        fullscreen = true,
+                        with_title_bar = false,
+                    })
+                end,
             },
             {
                 text = _("Refresh now"),

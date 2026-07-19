@@ -84,6 +84,7 @@ not know about.
 | **Text size** | Small / Medium / Large. |
 | **Hide battery and date** | Drops the secondary row and moves the time left onto the progress line. For use with the Boox status bar, which draws its own clock and battery over the sleep screen. |
 | **Cover enhancement** | Off by default. Adjusts the cover for the Kaleido 3 colour layer — see below. |
+| **Preview** | Renders and shows the result full screen, exactly as written to disk. Tap anywhere to close. |
 | **Refresh now** | Renders immediately and reports the result and timing. |
 | **Log render timings** | Writes render durations to the KOReader log. |
 
