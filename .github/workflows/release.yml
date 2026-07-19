@@ -6,11 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to attach zip to (e.g., v1.1.0)'
-        # Must not be required. A required dispatch input has no value when the
-        # workflow is compiled for a release event, which fails the run before it
-        # starts (startup_failure / BuildFailed) -- so the release trigger breaks
-        # while manual dispatch keeps working.
+        description: 'Release tag to attach the zip to (e.g. v1.1.0)'
+        # Deliberately not required: a required dispatch input has no value when
+        # the workflow is compiled for a release event.
         required: false
 
 permissions:
@@ -18,37 +16,52 @@ permissions:
 
 jobs:
   build:
+    name: Build and attach plugin zip
     runs-on: ubuntu-latest
 
     steps:
+      # One action, first-party, pinned to the last major that runs on node20.
+      # checkout v5/v6 and action-gh-release v3 all declare `using: node24`, and
+      # an action requiring a runtime the runner does not provide fails the whole
+      # workflow at startup -- no logs, no job, just "workflow file issue".
+      # The upload below uses the preinstalled gh CLI instead of a third-party
+      # action, so that is the only action dependency left to go wrong.
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
-          # `inputs` rather than `github.event.inputs`: the former is null on a
-          # release event, the latter is not defined for it at all.
+          # `inputs` is null outside workflow_dispatch; `github.event.inputs`
+          # is not defined for a release event at all.
           ref: ${{ inputs.tag || github.ref_name }}
 
-      - name: Create plugin directory structure
+      - name: Build plugin zip
         run: |
+          set -euo pipefail
           mkdir -p build/palmasleepscreen.koplugin
-          rsync -av --exclude='.git' \
-                    --exclude='.github' \
-                    --exclude='.claude' \
-                    --exclude='build' \
-                    --exclude='screenshots' \
-                    --exclude='.gitignore' \
-                    --exclude='.gitattributes' \
-                    . build/palmasleepscreen.koplugin/
-
-      - name: Create zip archive
-        run: |
+          # git archive applies the export-ignore rules in .gitattributes, so the
+          # exclusion list lives with the repo rather than being duplicated here
+          # where it would drift. It also cannot pick up untracked files, so the
+          # zip is exactly the committed tree.
+          git archive --format=tar HEAD | tar -x -C build/palmasleepscreen.koplugin
           cd build
           zip -r palmasleepscreen.koplugin.zip palmasleepscreen.koplugin
+          echo "--- archive contents ---"
+          unzip -l palmasleepscreen.koplugin.zip
 
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          files: build/palmasleepscreen.koplugin.zip
+      - name: Verify the plugin is intact
+        run: |
+          set -euo pipefail
+          cd build/palmasleepscreen.koplugin
+          # A zip that is missing these is worse than a failed build: it installs
+          # and then does nothing.
+          test -f main.lua
+          test -f _meta.lua
+          grep -q 'version' _meta.lua
+          echo "packaged version: $(grep -o 'version = "[^"]*"' _meta.lua)"
+
+      - name: Attach to release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ inputs.tag || github.ref_name }}" \
+            build/palmasleepscreen.koplugin.zip --clobber

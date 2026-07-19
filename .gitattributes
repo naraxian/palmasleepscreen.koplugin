@@ -1,6 +1,7 @@
 # Keep repo furniture and the screenshot out of the archives GitHub generates
 # for a release: what you download should be exactly what you drop into
 # koreader/plugins/, nothing else.
-screenshots/ export-ignore
+screenshots/  export-ignore
+.github/      export-ignore
 .gitattributes export-ignore
 .gitignore    export-ignore
