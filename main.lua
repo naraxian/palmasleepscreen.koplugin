@@ -646,17 +646,20 @@ local PalmaSleepScreen = WidgetContainer:extend{
     is_doc_only = true,
 }
 
--- Output encodings, kept switchable because the Boox screensaver does not show
--- the file untouched -- it re-renders it through its own pipeline, and which
--- decoder it picks (and what that pipeline then does) depends on the file. The
--- alpha channel is the main suspect: a KOReader RGB32 buffer encodes to a
--- 4-channel PNG, and an image carrying alpha plausibly takes a compositing path
--- an opaque one does not. JPEG cannot carry alpha at all.
+-- Output encodings. Added to test whether the Boox screensaver's re-render
+-- depended on the file -- in particular whether the alpha channel in KOReader's
+-- 4-channel PNG triggered a compositing path an opaque image would skip. It does
+-- not: the device accepts all of these and renders them identically, so the
+-- transform acts on the decoded bitmap. Kept switchable anyway, since the null
+-- result is what rules the file out.
 local FORMATS = {
     { id = "png",   ext = "png", label = _("PNG, with alpha (default)") },
     { id = "png24", ext = "png", label = _("PNG, no alpha") },
     { id = "jpg",   ext = "jpg", label = _("JPEG") },
-    -- BMP is deliberately absent: writing one crashes KOReader.
+    -- BMP is deliberately absent. Writing one is fine; it is Preview that
+    -- crashes KOReader on it, because ImageViewer cannot decode BMP. Dropped
+    -- rather than guarded: the format turned out not to affect what the panel
+    -- shows, so it would be a preview hazard for no benefit.
 }
 
 local function isKnownFormat(id)
@@ -697,8 +700,8 @@ function PalmaSleepScreen:init()
 
     self.enabled = self.settings:nilOrTrue("enabled")
     self.format = self.settings:readSetting("format") or "png"
-    -- A format that has since been withdrawn (BMP, which crashed on write) would
-    -- otherwise leave an existing install pinned to it with no way back.
+    -- A format that has since been withdrawn (BMP) would otherwise leave an
+    -- existing install pinned to it with no way back.
     if not isKnownFormat(self.format) then
         self.format = "png"
         self.settings:saveSetting("format", self.format)
@@ -1746,7 +1749,7 @@ The result is cached, so the work is done once per book rather than on every upd
                 text = _("Output format"),
                 help_text = _([[The Boox screensaver does not show the file untouched — it re-renders it through its own pipeline, which is why the same image looks right in Preview and wrong once the device sleeps.
 
-These are here to find an encoding that pipeline leaves alone. The alpha channel is the main suspect: KOReader's buffer encodes to a 4-channel PNG, and an image carrying alpha plausibly takes a compositing path an opaque one does not. JPEG cannot carry alpha at all.
+These were added to find an encoding that pipeline leaves alone. None of them is: the device accepts them all and renders them identically, which means the transform acts on the decoded image rather than the file. Greyscale and quantization are the useful levers instead.
 
 Changing this renames the output file, so re-point the system sleep screen setting at it — otherwise the system keeps showing the old file and every format will look identical.
 

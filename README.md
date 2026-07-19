@@ -104,15 +104,29 @@ Painting the image directly at suspend was tried and does not work: Android
 freezes the surface before the repaint reaches the panel, so the pre-suspend
 screen is what stays up.
 
-So these options exist to hunt for an encoding that pipeline leaves alone:
+These options were added to hunt for an encoding that pipeline leaves alone.
+**It did not find one.** Boox accepts all of them, and they all look the same on
+the panel.
+
+That null result is worth keeping, because it rules something out: the formats
+differ in container, channel count and compression, so identical output means the
+system is transforming the **decoded bitmap**, not reacting to the file. No
+encoding change will help. What remains is pre-compensation and measurement — the
+options below.
 
 | Format | Notes |
 | --- | --- |
 | **PNG, with alpha** | The default, and what earlier versions always wrote. KOReader's RGB32 buffer encodes to a 4-channel PNG. |
-| **PNG, no alpha** | The same image through the 3-channel encoder. The alpha channel is the main suspect — an image carrying alpha plausibly takes a compositing path an opaque one does not. |
+| **PNG, no alpha** | The same image through the 3-channel encoder. Added to test whether the alpha channel triggered a compositing path; it does not. |
 | **JPEG** | Cannot carry alpha at all. Quality is adjustable (default 90). |
 
-Two things will make every format look identical if you miss them:
+BMP was tried too and has been removed. Writing one works; it is **Preview** that
+crashes KOReader on it, because ImageViewer cannot decode BMP. Since the format
+turned out not to affect what the panel shows, it was dropped rather than given a
+preview guard.
+
+Two things will make every format look identical for the wrong reason, if you
+re-test:
 
 - **Changing the format renames the output file.** Re-point the system sleep
   screen setting at the new path. The plugin reports the new and old paths when
@@ -123,13 +137,6 @@ Two things will make every format look identical if you miss them:
 **Refresh now** reports the rendered dimensions. If they are not the panel's
 native resolution, the system is rescaling the image before it ever reaches the
 screen, and that alone would alter the colours.
-
-In practice they all look the same on the panel. That is itself a result: they
-differ in container, channel count and compression, so if the output is identical
-the system is transforming the **decoded bitmap**, not reacting to the file. No
-encoding change will help, and the remaining options are pre-compensation and
-measurement. BMP was tried too and has been removed — writing one crashes
-KOReader.
 
 ### Greyscale output
 
@@ -219,9 +226,9 @@ parameter clears the cache; **Rebuild cached covers** clears it by hand.
 
 ## Notes and gotchas
 
-**PNG is the default output.** Other formats are selectable under **Output
-format**, but not every device accepts them as a sleep screen — if the system
-stops showing the image after a format change, that is the likely reason.
+**PNG is the default output**, with JPEG selectable under **Output format**.
+Boox accepts either as a sleep screen and renders them identically, so the format
+is not worth changing unless you are testing something specific.
 
 **The default is per-chapter, not per-page.** Encoding a full-screen PNG of
 photographic cover art costs roughly 120–170 ms on a desktop and several times
