@@ -77,7 +77,6 @@ not know about.
 | Setting | Notes |
 | --- | --- |
 | **Enabled** | Turns the whole plugin on and off. |
-| **Draw on screen instead of writing a file** | Paints the sleep screen onto the panel at suspend rather than writing a PNG. See below. |
 | **Output file** | Full path to the PNG. Pick a folder, then confirm the filename. Always saved as `.png`. |
 | **Check output path** | Performs a real test write and reports what happened. Start here if no file is appearing. |
 | **Update** | `Every chapter` (default), `Every page`, or `Every N pages`. |
@@ -88,30 +87,6 @@ not know about.
 | **Preview** | Renders and shows the result full screen, exactly as written to disk. Tap anywhere to close. |
 | **Refresh now** | Renders immediately and reports the result and timing. |
 | **Log render timings** | Writes render durations to the KOReader log. |
-
-### Drawing on screen instead of writing a file
-
-A PNG handed to the Boox screensaver does not reach the panel untouched. Boox
-renders it through its own screensaver pipeline, which applies its own colour
-handling, so the same file looks different there than it does in KOReader. This
-is why the same image can look right in **Preview** and wrong once the device
-sleeps, with the frontlight ruled out.
-
-Boox's **transparent** screensaver takes a different path: it keeps whatever is
-already on the panel instead of rendering a file. So painting the image directly
-and letting e-ink hold it is the only way to get exactly the colours KOReader
-rendered.
-
-With this option on, the plugin composes the sleep screen as the device suspends
-and paints it on screen, and closes it again on resume. Requirements:
-
-- Set the Boox screensaver to **transparent**.
-- KOReader has to be in the foreground when the device sleeps.
-- No file is written, and the update triggers do nothing — the image is composed
-  at suspend, from the state at that moment.
-
-**Preview** follows whichever mode is active, so it exercises the same path the
-device will.
 
 ### Cover enhancement
 
