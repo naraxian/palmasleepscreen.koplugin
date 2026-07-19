@@ -1,0 +1,28 @@
+main.lua
+  s_1bd20688f5746c::t_6200a60a3a2e30 1751-1793
+  s_1bd20688f5746c::t_a9c397b349e861 1232-1234
+  s_1bd20688f5746c::t_95d709b72e8edd 411-498
+  s_1bd20688f5746c::t_ba8ea350a141a0 676-678
+  s_1bd20688f5746c::t_ad4e8b5cf3bafd 1465-1477
+  s_1bd20688f5746c::t_3f36b2cea14912 1260-1278
+  s_1bd20688f5746c::t_a2f04d0a224098 351-410
+README.md
+  s_1bd20688f5746c::t_a44f49bd560555 127-170
+  s_1bd20688f5746c::t_200f7add523c7d 90-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "3ac463e9e1d5605bb336944e46ba44b765c3129b",
+  "prompts": {},
+  "sessions": {
+    "s_1bd20688f5746c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8de2988-d236-4c5b-b7ca-b14f8c95bf53",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Nara Xian <hello@naraxian.net>"
+    }
+  }
+}
