@@ -87,6 +87,7 @@ not know about.
 | **Preview** | Renders and shows the result full screen, exactly as written to disk. Tap anywhere to close. |
 | **Refresh now** | Renders immediately and reports the result, timing, dimensions and file size. |
 | **Output format** | Experimental — see below. |
+| **Greyscale output** | Drops all colour before writing. See below. |
 | **Colour quantization** | Experimental — reduces the image to the panel's palette. See below. |
 | **Write test pattern instead** | Diagnostic — replaces the sleep screen with a card of known values. See below. |
 | **Log render timings** | Writes render durations to the KOReader log. |
@@ -110,7 +111,6 @@ So these options exist to hunt for an encoding that pipeline leaves alone:
 | **PNG, with alpha** | The default, and what earlier versions always wrote. KOReader's RGB32 buffer encodes to a 4-channel PNG. |
 | **PNG, no alpha** | The same image through the 3-channel encoder. The alpha channel is the main suspect — an image carrying alpha plausibly takes a compositing path an opaque one does not. |
 | **JPEG** | Cannot carry alpha at all. Quality is adjustable (default 90). |
-| **BMP** | Uncompressed, no alpha, no colour metadata. |
 
 Two things will make every format look identical if you miss them:
 
@@ -124,11 +124,22 @@ Two things will make every format look identical if you miss them:
 native resolution, the system is rescaling the image before it ever reaches the
 screen, and that alone would alter the colours.
 
-In practice all four formats look the same on the panel. That is itself a
-result: they differ in container, channel count and compression, so if the
-output is identical the system is transforming the **decoded bitmap**, not
-reacting to the file. No encoding change will help, and the remaining options
-are pre-compensation and measurement.
+In practice they all look the same on the panel. That is itself a result: they
+differ in container, channel count and compression, so if the output is identical
+the system is transforming the **decoded bitmap**, not reacting to the file. No
+encoding change will help, and the remaining options are pre-compensation and
+measurement. BMP was tried too and has been removed — writing one crashes
+KOReader.
+
+### Greyscale output
+
+Drops all colour before the image is written. The colour layer is the part the
+system reprocesses, and the **power-off** screensaver slot is monochrome
+regardless of what you feed it, so removing chroma leaves its colour handling
+nothing to act on.
+
+Paired with 16-level quantization the result lands exactly on the greys the
+monochrome layer renders. Applied before quantization for that reason.
 
 ### Colour quantization
 

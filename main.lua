@@ -379,6 +379,24 @@ local BAYER8 = {
     63, 31, 55, 23, 61, 29, 53, 21,
 }
 
+--- Flattens `bb` to grey in place. `bb` must be RGB32.
+--
+-- Worth having on its own: the Kaleido colour layer is the part that gets
+-- reprocessed, and the power-off screensaver slot is documented as monochrome
+-- anyway. Dropping chroma before the system sees it removes everything its
+-- colour handling could act on, and paired with 16-level quantization the result
+-- lands exactly on the greys the monochrome layer renders.
+local function toGreyscale(bb)
+    local w, h = bb:getWidth(), bb:getHeight()
+    for y = 0, h - 1 do
+        for x = 0, w - 1 do
+            local px = bb:getPixelP(x, y)
+            local v = clamp8(luminance(px.r, px.g, px.b) + 0.5)
+            px.r, px.g, px.b = v, v, v
+        end
+    end
+end
+
 --- Quantizes `bb` in place to `levels` values per channel. `bb` must be RGB32.
 local function quantizeToPalette(bb, levels, dither)
     local w, h = bb:getWidth(), bb:getHeight()
@@ -638,8 +656,15 @@ local FORMATS = {
     { id = "png",   ext = "png", label = _("PNG, with alpha (default)") },
     { id = "png24", ext = "png", label = _("PNG, no alpha") },
     { id = "jpg",   ext = "jpg", label = _("JPEG") },
-    { id = "bmp",   ext = "bmp", label = _("BMP") },
+    -- BMP is deliberately absent: writing one crashes KOReader.
 }
+
+local function isKnownFormat(id)
+    for _, f in ipairs(FORMATS) do
+        if f.id == id then return true end
+    end
+    return false
+end
 
 local function formatExt(id)
     for _, f in ipairs(FORMATS) do
@@ -672,7 +697,14 @@ function PalmaSleepScreen:init()
 
     self.enabled = self.settings:nilOrTrue("enabled")
     self.format = self.settings:readSetting("format") or "png"
+    -- A format that has since been withdrawn (BMP, which crashed on write) would
+    -- otherwise leave an existing install pinned to it with no way back.
+    if not isKnownFormat(self.format) then
+        self.format = "png"
+        self.settings:saveSetting("format", self.format)
+    end
     self.jpeg_quality = self.settings:readSetting("jpeg_quality") or 90
+    self.greyscale = self.settings:isTrue("greyscale")
     self.quantize = self.settings:readSetting("quantize") or 0
     self.dither = self.settings:nilOrTrue("dither")
     self.test_pattern = self.settings:isTrue("test_pattern")
@@ -1270,8 +1302,12 @@ function PalmaSleepScreen:doRender()
         bb, m = self:composeImage()
     end
 
-    -- Last, on the finished image: quantizing before compositing would let the
-    -- text and panel land back off-palette.
+    -- Both run last, on the finished image: quantizing before compositing would
+    -- let the text and panel land back off-palette. Grey first, so quantization
+    -- lands the result on the panel's grey levels rather than near them.
+    if self.greyscale then
+        toGreyscale(bb)
+    end
     if self.quantize > 0 then
         quantizeToPalette(bb, self.quantize, self.dither)
     end
@@ -1292,8 +1328,6 @@ function PalmaSleepScreen:doRender()
         rgb24:free()
     elseif self.format == "jpg" then
         written = bb:writeToFile(tmp, "jpg", self.jpeg_quality)
-    elseif self.format == "bmp" then
-        written = bb:writeToFile(tmp, "bmp")
     else
         written = bb:writeToFile(tmp, "png")
     end
@@ -1747,6 +1781,19 @@ The device may also cache the sleep screen. If a change appears to do nothing, r
                     })
                     return t
                 end)(),
+            },
+            {
+                text = _("Greyscale output"),
+                help_text = _([[Drops all colour before writing the image.
+
+The colour layer is the part the system reprocesses, and the power-off screensaver slot is monochrome regardless. Removing chroma leaves its colour handling nothing to act on.
+
+Paired with 16-level quantization the result lands exactly on the greys the monochrome layer renders.]]),
+                checked_func = function() return self.greyscale end,
+                callback = function()
+                    self:saveSetting("greyscale", not self.greyscale)
+                    self:render(true)
+                end,
             },
             {
                 text = _("Colour quantization"),
