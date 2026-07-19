@@ -28,8 +28,10 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local ffi = require("ffi")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local md5 = require("ffi/sha2").md5
 local time = require("ui/time")
 local util = require("util")
 local _ = require("gettext")
@@ -191,6 +193,119 @@ local function ensureContrast(panel)
 end
 
 ---------------------------------------------------------------------------
+-- cover enhancement
+---------------------------------------------------------------------------
+
+-- The Kaleido 3 panel is two layers at different resolutions: the monochrome
+-- layer runs at the full 300 PPI, the colour filter array over it at 150. So
+-- luminance detail resolves at twice the resolution of chroma, and the filter
+-- absorbs enough light that untouched sRGB art reads dark and washed out.
+--
+-- Hence the luma/chroma split below: the tone curve and the unsharp mask act on
+-- luminance alone -- sharpening the layer that can actually resolve it, with no
+-- colour fringing -- while saturation scales the chroma offsets around it.
+local ENHANCE_DEFAULTS = {
+    saturation = 1.6,  -- chroma multiplier, compensating for the filter array
+    brightness = 1.05, -- gamma; above 1 lifts the midtones
+    contrast = 0.25,   -- blend toward a smoothstep S-curve; 0 is off
+    sharpness = 0.8,   -- unsharp mask amount, on luminance only
+}
+-- Bump when the pipeline changes shape, to invalidate every cached cover.
+local ENHANCE_VERSION = 1
+local SHARPEN_RADIUS = 2
+
+--- Separable box blur over an 8-bit plane. Only ever feeds the unsharp mask, so
+-- a box kernel is enough -- a gaussian would cost more for no visible gain.
+local function boxBlur(src, dst, w, h, r)
+    local tmp = ffi.new("uint8_t[?]", w * h)
+    for y = 0, h - 1 do
+        local row = y * w
+        local sum = 0
+        for x = 0, math.min(r, w - 1) do sum = sum + src[row + x] end
+        for x = 0, w - 1 do
+            local lo, hi = math.max(x - r, 0), math.min(x + r, w - 1)
+            tmp[row + x] = sum / (hi - lo + 1)
+            if x + r + 1 <= w - 1 then sum = sum + src[row + x + r + 1] end
+            if x - r >= 0 then sum = sum - src[row + x - r] end
+        end
+    end
+    for x = 0, w - 1 do
+        local sum = 0
+        for y = 0, math.min(r, h - 1) do sum = sum + tmp[y * w + x] end
+        for y = 0, h - 1 do
+            local lo, hi = math.max(y - r, 0), math.min(y + r, h - 1)
+            dst[y * w + x] = sum / (hi - lo + 1)
+            if y + r + 1 <= h - 1 then sum = sum + tmp[(y + r + 1) * w + x] end
+            if y - r >= 0 then sum = sum - tmp[(y - r) * w + x] end
+        end
+    end
+end
+
+--- Applies the tone curve, unsharp mask and saturation boost to `bb` in place.
+-- `bb` must be TYPE_BBRGB32.
+local function enhanceCover(bb, p)
+    local w, h = bb:getWidth(), bb:getHeight()
+    if w < 3 or h < 3 then return end
+    local n = w * h
+
+    local luma = ffi.new("uint8_t[?]", n)
+    for y = 0, h - 1 do
+        local row = y * w
+        for x = 0, w - 1 do
+            local px = bb:getPixelP(x, y)
+            luma[row + x] = luminance(px.r, px.g, px.b)
+        end
+    end
+
+    local blur
+    if p.sharpness ~= 0 then
+        blur = ffi.new("uint8_t[?]", n)
+        boxBlur(luma, blur, w, h, SHARPEN_RADIUS)
+    end
+
+    -- gamma, then a blend toward a smoothstep S-curve, resolved once into a LUT
+    local curve = ffi.new("uint8_t[?]", 256)
+    for i = 0, 255 do
+        local v = i / 255
+        if p.brightness ~= 1 then v = v ^ (1 / p.brightness) end
+        if p.contrast ~= 0 then
+            v = v + (v * v * (3 - 2 * v) - v) * p.contrast
+        end
+        curve[i] = clamp8(v * 255 + 0.5)
+    end
+
+    for y = 0, h - 1 do
+        local row = y * w
+        for x = 0, w - 1 do
+            local i = row + x
+            local px = bb:getPixelP(x, y)
+            local l = luma[i]
+            local sharp = l
+            if blur then
+                sharp = clamp8(l + (l - blur[i]) * p.sharpness)
+            end
+            -- New luminance, with the original chroma offsets scaled around it.
+            local l2 = curve[sharp]
+            local r, g, b = px.r, px.g, px.b
+            px.r = clamp8(l2 + (r - l) * p.saturation)
+            px.g = clamp8(l2 + (g - l) * p.saturation)
+            px.b = clamp8(l2 + (b - l) * p.saturation)
+        end
+    end
+end
+
+--- getPixelP only yields a writable ColorRGB32* on an RGB32 buffer, and the
+-- decoded cover may be any type. Frees the input when it converts.
+local function toRGB32(bb)
+    if bb:getType() == Blitbuffer.TYPE_BBRGB32 then return bb end
+    local w, h = bb:getWidth(), bb:getHeight()
+    local out = Blitbuffer.new(w, h, Blitbuffer.TYPE_BBRGB32)
+    out:blitFrom(bb, 0, 0, 0, 0, w, h)
+    bb:free()
+    return out
+end
+
+---------------------------------------------------------------------------
 -- progress bar
 ---------------------------------------------------------------------------
 
@@ -319,6 +434,11 @@ function PalmaSleepScreen:init()
     self.interval = self.settings:readSetting("interval") or 10
     self.text_scale = self.settings:readSetting("text_scale") or 1.0
     self.compact_meta = self.settings:isTrue("compact_meta")
+    self.enhance = self.settings:isTrue("enhance")
+    self.enhance_params = {}
+    for key, default in pairs(ENHANCE_DEFAULTS) do
+        self.enhance_params[key] = self.settings:readSetting("enhance_" .. key) or default
+    end
     self.render_on_suspend = self.settings:isTrue("render_on_suspend")
     self.debug = self.settings:isTrue("debug")
 
@@ -646,6 +766,74 @@ function PalmaSleepScreen:buildPanel(width, m, fg, panel_color, data)
 end
 
 ---------------------------------------------------------------------------
+-- cover cache
+---------------------------------------------------------------------------
+
+-- Enhancement is a few passes over every pixel of a full-screen cover, so the
+-- result is kept on disk and reused until the book, the geometry or one of the
+-- parameters changes -- all of which are folded into the cache key.
+
+local function coverCacheDir()
+    return DataStorage:getDataDir() .. "/cache/palmasleepscreen"
+end
+
+function PalmaSleepScreen:coverCachePath(cover_w, cover_h)
+    local file = self.ui.document and self.ui.document.file
+    if not file then return nil end
+    local p = self.enhance_params
+    local key = string.format("%s|%s|%s|%dx%d|%d|%s|%s|%s|%s",
+        file,
+        tostring(lfs.attributes(file, "modification")),
+        tostring(lfs.attributes(file, "size")),
+        cover_w, cover_h, ENHANCE_VERSION,
+        tostring(p.saturation), tostring(p.brightness),
+        tostring(p.contrast), tostring(p.sharpness))
+    return coverCacheDir() .. "/" .. md5(key) .. ".png"
+end
+
+--- Removes every cached cover. Called whenever a parameter changes: the key
+-- changes with it, so the existing files are unreachable rather than merely stale.
+function PalmaSleepScreen:clearCoverCache()
+    local dir = coverCacheDir()
+    if lfs.attributes(dir, "mode") ~= "directory" then return end
+    for name in lfs.dir(dir) do
+        if name:match("%.png$") then os.remove(dir .. "/" .. name) end
+    end
+end
+
+function PalmaSleepScreen:loadCachedCover(path, cover_w, cover_h)
+    if not path or lfs.attributes(path, "mode") ~= "file" then return nil end
+    local ok, bb = pcall(function() return RenderImage:renderImageFile(path) end)
+    if not ok or not bb then return nil end
+    -- A mismatch means the file is not what the key promised; discard it.
+    if bb:getWidth() ~= cover_w or bb:getHeight() ~= cover_h then
+        bb:free()
+        os.remove(path)
+        return nil
+    end
+    return bb
+end
+
+function PalmaSleepScreen:saveCachedCover(bb, path)
+    if not path then return end
+    local dir = coverCacheDir()
+    if lfs.attributes(dir, "mode") ~= "directory" then
+        lfs.mkdir(DataStorage:getDataDir() .. "/cache")
+        if not lfs.mkdir(dir) and lfs.attributes(dir, "mode") ~= "directory" then
+            logger.warn("PalmaSleepScreen: could not create", dir)
+            return
+        end
+    end
+    -- Write and rename, so a cover interrupted mid-write is never read back.
+    local tmp = path .. ".tmp"
+    if bb:writeToFile(tmp, "png") and (lfs.attributes(tmp, "size") or 0) > 0 then
+        os.rename(tmp, path)
+    else
+        os.remove(tmp)
+    end
+end
+
+---------------------------------------------------------------------------
 -- preparation (cached per book)
 ---------------------------------------------------------------------------
 
@@ -708,7 +896,24 @@ function PalmaSleepScreen:prepare(m, data)
                 cover_h = max_cover_h
                 cover_w = math.floor(iw * (cover_h / ih) + 0.5)
             end
-            prepared.cover_bb = RenderImage:scaleBlitBuffer(cover_bb, cover_w, cover_h, true)
+            local cache_path = self.enhance and self:coverCachePath(cover_w, cover_h) or nil
+            local scaled = cache_path and self:loadCachedCover(cache_path, cover_w, cover_h) or nil
+            if scaled then
+                cover_bb:free()
+            else
+                scaled = RenderImage:scaleBlitBuffer(cover_bb, cover_w, cover_h, true)
+                if self.enhance then
+                    scaled = toRGB32(scaled)
+                    local t = time.now()
+                    enhanceCover(scaled, self.enhance_params)
+                    if self.debug then
+                        logger.info(string.format("PalmaSleepScreen: cover enhancement took %.1f ms",
+                            time.to_ms(time.since(t))))
+                    end
+                    self:saveCachedCover(scaled, cache_path)
+                end
+            end
+            prepared.cover_bb = scaled
             prepared.cover_w = cover_w
             prepared.cover_h = cover_h
             prepared.cover_x = math.floor((m.screen_w - cover_w) / 2)
@@ -960,6 +1165,41 @@ function PalmaSleepScreen:menuEntryTextScale(scale, label)
     }
 end
 
+--- A spinner over one enhancement parameter. Any change invalidates every
+-- cached cover, since the parameters are part of the cache key.
+function PalmaSleepScreen:menuEntryEnhanceParam(key, label, min, max, step)
+    return {
+        text_func = function()
+            return T(_("%1: %2"), label, string.format("%.2f", self.enhance_params[key]))
+        end,
+        enabled_func = function() return self.enhance end,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            UIManager:show(SpinWidget:new{
+                value = self.enhance_params[key],
+                value_min = min,
+                value_max = max,
+                value_step = step,
+                value_hold_step = step * 4,
+                precision = "%.2f",
+                default_value = ENHANCE_DEFAULTS[key],
+                title_text = label,
+                ok_text = _("Set"),
+                callback = function(spin)
+                    local value = math.floor(spin.value * 100 + 0.5) / 100
+                    self.enhance_params[key] = value
+                    self.settings:saveSetting("enhance_" .. key, value)
+                    self.settings:flush()
+                    self:clearCoverCache()
+                    self:releasePrepared()
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                    self:requestRender()
+                end,
+            })
+        end,
+    }
+end
+
 function PalmaSleepScreen:addToMainMenu(menu_items)
     menu_items.palmasleepscreen = {
         sorting_hint = "screen",
@@ -1056,6 +1296,43 @@ For use with the Boox system status bar, which draws its own clock and battery o
                     self:releasePrepared()
                     self:requestRender()
                 end,
+            },
+            {
+                text = _("Cover enhancement"),
+                help_text = _([[Adjusts the cover for the Kaleido 3 colour layer, which resolves colour at half the resolution of the monochrome layer and absorbs enough light to leave covers looking dark and washed out.
+
+Brightness, contrast and sharpness act on luminance only, so sharpening picks up the full resolution of the monochrome layer without colouring the edges. Saturation compensates for the colour filter.
+
+The result is cached, so the work is done once per book rather than on every update.]]),
+                sub_item_table = {
+                    {
+                        text = _("Enabled"),
+                        checked_func = function() return self.enhance end,
+                        callback = function()
+                            self:saveSetting("enhance", not self.enhance)
+                            self:releasePrepared()
+                            self:requestRender()
+                        end,
+                        separator = true,
+                    },
+                    self:menuEntryEnhanceParam("saturation", _("Saturation"), 1.0, 2.5, 0.05),
+                    self:menuEntryEnhanceParam("brightness", _("Brightness"), 0.7, 1.5, 0.05),
+                    self:menuEntryEnhanceParam("contrast", _("Contrast"), 0.0, 1.0, 0.05),
+                    self:menuEntryEnhanceParam("sharpness", _("Sharpness"), 0.0, 2.0, 0.1),
+                    {
+                        text = _("Rebuild cached covers"),
+                        keep_menu_open = true,
+                        callback = function()
+                            self:clearCoverCache()
+                            self:releasePrepared()
+                            self:requestRender()
+                            UIManager:show(InfoMessage:new{
+                                text = _("Cached covers cleared."),
+                                timeout = 2,
+                            })
+                        end,
+                    },
+                },
                 separator = true,
             },
             {

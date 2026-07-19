@@ -82,8 +82,35 @@ not know about.
 | **Update** | `Every chapter` (default), `Every page`, or `Every N pages`. |
 | **Also update when the device sleeps** | Off by default. See the caveat below. |
 | **Text size** | Small / Medium / Large. |
+| **Hide battery and date** | Drops the secondary row and moves the time left onto the progress line. For use with the Boox status bar, which draws its own clock and battery over the sleep screen. |
+| **Cover enhancement** | Off by default. Adjusts the cover for the Kaleido 3 colour layer — see below. |
 | **Refresh now** | Renders immediately and reports the result and timing. |
 | **Log render timings** | Writes render durations to the KOReader log. |
+
+### Cover enhancement
+
+The Kaleido 3 screen is two layers at different resolutions: the monochrome
+layer runs at the full 300 PPI, the colour filter array over it at 150. Colour
+therefore resolves at half the detail of luminance, and the filter absorbs
+enough light that an untouched sRGB cover reads dark and washed out.
+
+The enhancement splits the cover into luminance and chroma and treats them
+separately:
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| **Saturation** | 1.60 | Scales the chroma offsets, compensating for the filter array. |
+| **Brightness** | 1.05 | Gamma on luminance; above 1 lifts the midtones. |
+| **Contrast** | 0.25 | Blends luminance toward a smoothstep S-curve. 0 is off. |
+| **Sharpness** | 0.80 | Unsharp mask on luminance only, so edges pick up the full 300 PPI of the monochrome layer without colour fringing. |
+
+Defaults are a starting point, not a calibration — they were chosen from how the
+panel behaves, not measured against one. Expect to tune them by eye.
+
+The processed cover is cached under `cache/palmasleepscreen/` in the KOReader
+data directory, keyed by the book, the cover geometry and all four parameters,
+so the work happens once per book rather than on every update. Changing any
+parameter clears the cache; **Rebuild cached covers** clears it by hand.
 
 ## Notes and gotchas
 
