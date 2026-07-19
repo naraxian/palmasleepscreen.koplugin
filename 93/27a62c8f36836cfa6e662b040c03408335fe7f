@@ -1,0 +1,29 @@
+README.md
+  s_1bd20688f5746c::t_92c76bb2369ac8 90-114
+  s_1bd20688f5746c::t_74abf38ebc7657 85-86
+main.lua
+  s_1bd20688f5746c::t_a1f74dd7daf7f3 195,768-835
+  s_1bd20688f5746c::t_532f028fac4cae 1168-1190,1193-1202
+  s_1bd20688f5746c::t_1ced9f4d527bc9 1299-1335
+  s_1bd20688f5746c::t_f1f8181344560a 899-916
+  s_1bd20688f5746c::t_0b982c79202992 31,34
+  s_1bd20688f5746c::t_de70cc67844f9a 196-307
+  s_1bd20688f5746c::t_a231185f37feab 1191-1192
+  s_1bd20688f5746c::t_0e48c77ecfcbc8 437-441
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "9327a62c8f36836cfa6e662b040c03408335fe7f",
+  "prompts": {},
+  "sessions": {
+    "s_1bd20688f5746c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8de2988-d236-4c5b-b7ca-b14f8c95bf53",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Nara Xian <hello@naraxian.net>"
+    }
+  }
+}
