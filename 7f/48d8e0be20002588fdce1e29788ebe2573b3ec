@@ -1,0 +1,24 @@
+.github/workflows/release.yml
+  s_1bd20688f5746c::t_2b67e2fea2e799 1-48
+main.lua
+  s_1bd20688f5746c::t_25347fcc7ea88b 321
+  s_1bd20688f5746c::t_417cb6842c87b6 585-597
+  s_1bd20688f5746c::t_661f65d3d09e58 1047-1058
+  s_1bd20688f5746c::t_6ab0f389519edf 663-664
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "7f48d8e0be20002588fdce1e29788ebe2573b3ec",
+  "prompts": {},
+  "sessions": {
+    "s_1bd20688f5746c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8de2988-d236-4c5b-b7ca-b14f8c95bf53",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Nara Xian <hello@naraxian.net>"
+    }
+  }
+}
