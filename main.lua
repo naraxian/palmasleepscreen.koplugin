@@ -348,6 +348,15 @@ local function enhanceCover(bb, p)
     end
 end
 
+--- Opaque copy, for the encoders that key off the channel count. Does not free
+-- the input -- the caller still owns it.
+local function toRGB24(bb)
+    local w, h = bb:getWidth(), bb:getHeight()
+    local out = Blitbuffer.new(w, h, Blitbuffer.TYPE_BBRGB24)
+    out:blitFrom(bb, 0, 0, 0, 0, w, h)
+    return out
+end
+
 --- getPixelP only yields a writable ColorRGB32* on an RGB32 buffer, and the
 -- decoded cover may be any type. Frees the input when it converts.
 local function toRGB32(bb)
@@ -471,13 +480,33 @@ local PalmaSleepScreen = WidgetContainer:extend{
     is_doc_only = true,
 }
 
---- The output is always PNG, so the path always ends in .png. Applied on both
--- read and write, which also repairs a path saved by an earlier version.
-local function normalizeOutputPath(path)
+-- Output encodings, kept switchable because the Boox screensaver does not show
+-- the file untouched -- it re-renders it through its own pipeline, and which
+-- decoder it picks (and what that pipeline then does) depends on the file. The
+-- alpha channel is the main suspect: a KOReader RGB32 buffer encodes to a
+-- 4-channel PNG, and an image carrying alpha plausibly takes a compositing path
+-- an opaque one does not. JPEG cannot carry alpha at all.
+local FORMATS = {
+    { id = "png",   ext = "png", label = _("PNG, with alpha (default)") },
+    { id = "png24", ext = "png", label = _("PNG, no alpha") },
+    { id = "jpg",   ext = "jpg", label = _("JPEG") },
+    { id = "bmp",   ext = "bmp", label = _("BMP") },
+}
+
+local function formatExt(id)
+    for _, f in ipairs(FORMATS) do
+        if f.id == id then return f.ext end
+    end
+    return "png"
+end
+
+--- Forces the path's extension to match the encoding. Applied on both read and
+-- write, which also repairs a path saved under a different format.
+local function normalizeOutputPath(path, format)
     if not path or path == "" then return path end
     local dir, name = util.splitFilePathName(path)
     if name == "" then return path end
-    return dir .. (name:gsub("%.[^%.]*$", "")) .. ".png"
+    return dir .. (name:gsub("%.[^%.]*$", "")) .. "." .. formatExt(format)
 end
 
 local function defaultOutputPath()
@@ -494,7 +523,10 @@ function PalmaSleepScreen:init()
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/palmasleepscreen.lua")
 
     self.enabled = self.settings:nilOrTrue("enabled")
-    self.output_path = normalizeOutputPath(self.settings:readSetting("output_path")) or defaultOutputPath()
+    self.format = self.settings:readSetting("format") or "png"
+    self.jpeg_quality = self.settings:readSetting("jpeg_quality") or 90
+    self.output_path = normalizeOutputPath(self.settings:readSetting("output_path"), self.format)
+        or normalizeOutputPath(defaultOutputPath(), self.format)
     -- Default is per-chapter, not per-page: a full-screen PNG of photographic
     -- cover art costs ~170 ms to encode here and several times that on device,
     -- which is too much to spend on every page turn.
@@ -1035,9 +1067,12 @@ function PalmaSleepScreen:render(interactive)
         logger.info(string.format("PalmaSleepScreen: render took %.1f ms", ms))
     end
     if interactive then
+        local size = lfs.attributes(self.output_path, "size") or 0
         UIManager:show(InfoMessage:new{
-            text = T(_("Sleep screen updated (%1 ms):\n%2"), math.floor(ms + 0.5), self.output_path),
-            timeout = 3,
+            text = T(_("Sleep screen updated (%1 ms)\n\n%2\n%3, %4, %5 kB"),
+                math.floor(ms + 0.5), self.output_path, self.last_size or "?",
+                self.format, math.floor(size / 1024 + 0.5)),
+            timeout = 5,
         })
     end
     return true
@@ -1069,9 +1104,27 @@ function PalmaSleepScreen:doRender()
     panel:paintTo(bb, m.margin, panel_top)
     panel:free()
 
+    -- reported alongside the render, so a size that is not the panel's native
+    -- resolution is visible rather than assumed -- anything else gets rescaled
+    -- by the system before it ever reaches the screen
+    self.last_size = string.format("%d × %d", m.screen_w, m.screen_h)
+
     -- never leave a partial image at the output path
     local tmp = self.output_path .. ".tmp"
-    local written = bb:writeToFile(tmp, "png")
+    local written
+    if self.format == "png24" then
+        -- BBRGB32:writePNG() encodes 4 channels; going through an RGB24 buffer
+        -- gets the 3-channel encoder, and an opaque file.
+        local rgb24 = toRGB24(bb)
+        written = rgb24:writeToFile(tmp, "png")
+        rgb24:free()
+    elseif self.format == "jpg" then
+        written = bb:writeToFile(tmp, "jpg", self.jpeg_quality)
+    elseif self.format == "bmp" then
+        written = bb:writeToFile(tmp, "bmp")
+    else
+        written = bb:writeToFile(tmp, "png")
+    end
     bb:free()
 
     -- Blitbuffer:writePNG() discards the return value of Png.encodeToFile(), so
@@ -1176,7 +1229,8 @@ function PalmaSleepScreen:chooseOutputPath(touchmenu_instance)
             local input
             input = InputDialog:new{
                 title = _("Filename"),
-                input = dir_path:gsub("/$", "") .. "/" .. (name ~= "" and name or "palma_sleepscreen.png"),
+                input = dir_path:gsub("/$", "") .. "/"
+                    .. (name ~= "" and name or ("palma_sleepscreen." .. formatExt(self.format))),
                 buttons = {{
                     {
                         text = _("Cancel"),
@@ -1186,7 +1240,7 @@ function PalmaSleepScreen:chooseOutputPath(touchmenu_instance)
                     {
                         text = _("Save"),
                         callback = function()
-                            local path = normalizeOutputPath(input:getInputText())
+                            local path = normalizeOutputPath(input:getInputText(), self.format)
                             local ok, reason = self:checkOutputPath(path)
                             if not ok then
                                 UIManager:show(InfoMessage:new{ text = reason, show_icon = true })
@@ -1204,6 +1258,36 @@ function PalmaSleepScreen:chooseOutputPath(touchmenu_instance)
             input:onShowKeyboard()
         end,
     })
+end
+
+--- Switching encoding moves the output path with it. Reported rather than
+-- applied silently: the system points at one specific file, and a format change
+-- that renames it out from under that setting looks exactly like "the new format
+-- made no difference".
+function PalmaSleepScreen:menuEntryFormat(fmt)
+    return {
+        text = fmt.label,
+        checked_func = function() return self.format == fmt.id end,
+        radio = true,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            local old_path = self.output_path
+            self:saveSetting("format", fmt.id)
+            local path = normalizeOutputPath(self.output_path, fmt.id)
+            if path ~= self.output_path then
+                self:saveSetting("output_path", path)
+            end
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+            self:render(true)
+            if path ~= old_path then
+                UIManager:show(InfoMessage:new{
+                    text = T(_("The output file is now:\n%1\n\nPoint the system sleep screen at it — the old file is still at:\n%2"),
+                        path, old_path),
+                    show_icon = true,
+                })
+            end
+        end,
+    }
 end
 
 function PalmaSleepScreen:menuEntryTrigger(mode, label)
@@ -1438,6 +1522,46 @@ The result is cached, so the work is done once per book rather than on every upd
                 text = _("Refresh now"),
                 keep_menu_open = true,
                 callback = function() self:render(true) end,
+            },
+            {
+                text = _("Output format"),
+                help_text = _([[The Boox screensaver does not show the file untouched — it re-renders it through its own pipeline, which is why the same image looks right in Preview and wrong once the device sleeps.
+
+These are here to find an encoding that pipeline leaves alone. The alpha channel is the main suspect: KOReader's buffer encodes to a 4-channel PNG, and an image carrying alpha plausibly takes a compositing path an opaque one does not. JPEG cannot carry alpha at all.
+
+Changing this renames the output file, so re-point the system sleep screen setting at it — otherwise the system keeps showing the old file and every format will look identical.
+
+The device may also cache the sleep screen. If a change appears to do nothing, reboot before concluding it did not work.]]),
+                sub_item_table = (function()
+                    local t = {}
+                    for _, fmt in ipairs(FORMATS) do
+                        table.insert(t, self:menuEntryFormat(fmt))
+                    end
+                    t[#t].separator = true
+                    table.insert(t, {
+                        text_func = function()
+                            return T(_("JPEG quality: %1"), self.jpeg_quality)
+                        end,
+                        enabled_func = function() return self.format == "jpg" end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            UIManager:show(SpinWidget:new{
+                                value = self.jpeg_quality,
+                                value_min = 50,
+                                value_max = 100,
+                                default_value = 90,
+                                title_text = _("JPEG quality"),
+                                ok_text = _("Set"),
+                                callback = function(spin)
+                                    self:saveSetting("jpeg_quality", spin.value)
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:render(true)
+                                end,
+                            })
+                        end,
+                    })
+                    return t
+                end)(),
             },
             {
                 text = _("Log render timings"),

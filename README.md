@@ -77,7 +77,7 @@ not know about.
 | Setting | Notes |
 | --- | --- |
 | **Enabled** | Turns the whole plugin on and off. |
-| **Output file** | Full path to the PNG. Pick a folder, then confirm the filename. Always saved as `.png`. |
+| **Output file** | Full path to the image. Pick a folder, then confirm the filename. The extension always follows the output format. |
 | **Check output path** | Performs a real test write and reports what happened. Start here if no file is appearing. |
 | **Update** | `Every chapter` (default), `Every page`, or `Every N pages`. |
 | **Also update when the device sleeps** | Off by default. See the caveat below. |
@@ -85,8 +85,42 @@ not know about.
 | **Hide battery and date** | Drops the secondary row and moves the time left onto the progress line. For use with the Boox status bar, which draws its own clock and battery over the sleep screen. |
 | **Cover enhancement** | Off by default. Adjusts the cover for the Kaleido 3 colour layer — see below. |
 | **Preview** | Renders and shows the result full screen, exactly as written to disk. Tap anywhere to close. |
-| **Refresh now** | Renders immediately and reports the result and timing. |
+| **Refresh now** | Renders immediately and reports the result, timing, dimensions and file size. |
+| **Output format** | Experimental — see below. |
 | **Log render timings** | Writes render durations to the KOReader log. |
+
+### Output format
+
+The Boox screensaver does not show the file untouched. It re-renders it through
+its own pipeline, which applies its own colour handling — which is why the same
+image can look right in **Preview** and wrong once the device sleeps, with the
+frontlight ruled out. Boox's *transparent* screensaver takes a different path
+(it keeps what is already on the panel), which is why colours are correct there.
+
+Painting the image directly at suspend was tried and does not work: Android
+freezes the surface before the repaint reaches the panel, so the pre-suspend
+screen is what stays up.
+
+So these options exist to hunt for an encoding that pipeline leaves alone:
+
+| Format | Notes |
+| --- | --- |
+| **PNG, with alpha** | The default, and what earlier versions always wrote. KOReader's RGB32 buffer encodes to a 4-channel PNG. |
+| **PNG, no alpha** | The same image through the 3-channel encoder. The alpha channel is the main suspect — an image carrying alpha plausibly takes a compositing path an opaque one does not. |
+| **JPEG** | Cannot carry alpha at all. Quality is adjustable (default 90). |
+| **BMP** | Uncompressed, no alpha, no colour metadata. |
+
+Two things will make every format look identical if you miss them:
+
+- **Changing the format renames the output file.** Re-point the system sleep
+  screen setting at the new path. The plugin reports the new and old paths when
+  you switch.
+- **The device may cache the sleep screen.** Reboot before concluding a format
+  made no difference.
+
+**Refresh now** reports the rendered dimensions. If they are not the panel's
+native resolution, the system is rescaling the image before it ever reaches the
+screen, and that alone would alter the colours.
 
 ### Cover enhancement
 
@@ -128,8 +162,9 @@ parameter clears the cache; **Rebuild cached covers** clears it by hand.
 
 ## Notes and gotchas
 
-**Output is always PNG.** Some devices, including Boox, will not accept anything
-else as a sleep screen.
+**PNG is the default output.** Other formats are selectable under **Output
+format**, but not every device accepts them as a sleep screen — if the system
+stops showing the image after a format change, that is the likely reason.
 
 **The default is per-chapter, not per-page.** Encoding a full-screen PNG of
 photographic cover art costs roughly 120–170 ms on a desktop and several times
