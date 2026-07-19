@@ -1,0 +1,33 @@
+main.lua
+  s_1bd20688f5746c::t_a9c212958bf577 1107-1111,1114-1127
+  s_1bd20688f5746c::t_10b09c18afff82 1527-1565
+  s_1bd20688f5746c::t_a5bc16c9c0ac89 1243
+  s_1bd20688f5746c::t_6aa04decdd6bed 1232-1233
+  s_1bd20688f5746c::t_0e1165c1586a12 483-505,509
+  s_1bd20688f5746c::t_14437a6606eae4 351-359
+  s_1bd20688f5746c::t_07686222a06225 526-529
+  s_1bd20688f5746c::t_186a9180b1a050 1070,1072-1075
+  s_1bd20688f5746c::t_58d863ae79c1ec 1263-1292
+  s_1bd20688f5746c::t_3f573f277a3f1d 1526
+README.md
+  s_1bd20688f5746c::t_bf405a9326351f 165-167
+  s_1bd20688f5746c::t_f49413ec4e9d92 80
+  s_1bd20688f5746c::t_27165b92887007 88-89,92-123
+  s_1bd20688f5746c::t_933fcb039ff1df 124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a84bf95781a0d8d88e3757d40708f54d58b29916",
+  "prompts": {},
+  "sessions": {
+    "s_1bd20688f5746c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8de2988-d236-4c5b-b7ca-b14f8c95bf53",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Nara Xian <hello@naraxian.net>"
+    }
+  }
+}
