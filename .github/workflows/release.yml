@@ -20,14 +20,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # One action, first-party, pinned to the last major that runs on node20.
-      # checkout v5/v6 and action-gh-release v3 all declare `using: node24`, and
-      # an action requiring a runtime the runner does not provide fails the whole
-      # workflow at startup -- no logs, no job, just "workflow file issue".
-      # The upload below uses the preinstalled gh CLI instead of a third-party
-      # action, so that is the only action dependency left to go wrong.
+      # The only action this workflow uses. The upload step below runs on the
+      # preinstalled gh CLI rather than a third-party action, which keeps the
+      # dependency surface to one first-party action with nothing else to track
+      # through deprecations.
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # `inputs` is null outside workflow_dispatch; `github.event.inputs`
           # is not defined for a release event at all.
